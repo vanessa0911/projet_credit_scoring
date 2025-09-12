@@ -1,32 +1,41 @@
 # streamlit_app.py
 import os
 import json
+from pathlib import Path
+
 import requests
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 
 # =========================
-# Page config — DOIT être la 1ère commande Streamlit
+# 1) Page config — DOIT être la première commande Streamlit
 # =========================
 st.set_page_config(page_title="Prêt à dépenser — Scoring", page_icon="💳", layout="wide")
 
 # =========================
-# Config API (robuste sans secrets.toml)
+# 2) Config API (ne lit st.secrets que si un secrets.toml existe)
 # =========================
 DEFAULT_API = "http://127.0.0.1:8000"  # API locale FastAPI
 API_URL = os.getenv("API_URL", DEFAULT_API)
-try:
-    # Si un .streamlit/secrets.toml existe ET contient API_URL, on l'utilise
-    if "API_URL" in st.secrets:
-        API_URL = st.secrets["API_URL"]
-except Exception:
-    # Pas de secrets.toml ou inaccessible -> on garde la valeur par défaut / env
-    pass
+
+# chemins possibles du secrets.toml
+_SECRETS_PATHS = [
+    Path.home() / ".streamlit" / "secrets.toml",
+    Path.cwd() / ".streamlit" / "secrets.toml",
+]
+
+# on NE lit st.secrets que si le fichier existe (évite l'erreur rouge "No secrets files found")
+if any(p.exists() for p in _SECRETS_PATHS):
+    try:
+        API_URL = st.secrets.get("API_URL", API_URL)
+    except Exception:
+        pass
 
 st.title("💳 Prêt à dépenser — Dashboard de scoring")
 
 # =========================
-# Utils
+# 3) Utils
 # =========================
 def coerce_value(v: str):
     """Convertit une saisie texte en int/float si possible, sinon string/None."""
@@ -48,8 +57,51 @@ def coerce_value(v: str):
         pass
     return v
 
+def decision_badge(text: str):
+    """Affiche un badge coloré (HTML simple)."""
+    text = (text or "").lower().strip()
+    if text == "accordé":
+        color_bg, color_text = "#16a34a", "white"   # vert
+        label = "ACCORDÉ"
+    elif text == "refusé":
+        color_bg, color_text = "#dc2626", "white"   # rouge
+        label = "REFUSÉ"
+    else:
+        color_bg, color_text = "#6b7280", "white"   # gris
+        label = text.upper() if text else "?"
+    st.markdown(
+        f"<span style='display:inline-block;padding:6px 10px;border-radius:14px;"
+        f"background:{color_bg};color:{color_text};font-weight:700;letter-spacing:.3px;'>{label}</span>",
+        unsafe_allow_html=True
+    )
+
+def gauge_prob(prob: float, title: str = "Probabilité défaut (%)"):
+    """Jauge Plotly 0-100%."""
+    val = max(0.0, min(1.0, float(prob))) * 100.0
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=val,
+            number={'suffix': "%", 'valueformat': ".1f"},
+            title={'text': title},
+            gauge={
+                'axis': {'range': [0, 100]},
+                'bar': {'thickness': 0.35},
+                'steps': [
+                    {'range': [0, 20], 'color': '#dcfce7'},
+                    {'range': [20, 40], 'color': '#bbf7d0'},
+                    {'range': [40, 60], 'color': '#fef3c7'},
+                    {'range': [60, 80], 'color': '#fdba74'},
+                    {'range': [80, 100], 'color': '#fecaca'},
+                ],
+            }
+        )
+    )
+    fig.update_layout(margin=dict(l=30, r=30, t=60, b=10), height=260)
+    st.plotly_chart(fig, use_container_width=True)
+
 # =========================
-# Appels API
+# 4) Appels API
 # =========================
 @st.cache_data(show_spinner=False, ttl=60)
 def get_health():
@@ -80,7 +132,7 @@ def call_explain(features: dict, top_k: int = 8):
     return r.json()
 
 # =========================
-# Bandeau statut + paramètres
+# 5) Bandeau statut + paramètres (avec explications)
 # =========================
 CUSTOM_T = None  # valeur par défaut si le slider n'est pas rendu (sécurité)
 
@@ -93,14 +145,20 @@ with col1:
     else:
         st.error("API non joignable. Vérifie que `uvicorn api:app --reload` tourne et que l'URL est correcte.")
         st.stop()
+
 with col2:
     st.subheader("⚙️ Paramètres")
     st.write(f"Endpoint API: `{API_URL}`")
     expected_cols = get_expected_features()
     with st.expander("Voir les colonnes attendues (avant encodage)"):
+        st.caption(
+            "Ce sont les **variables brutes** que l’API attend **avant imputation et encodage** "
+            "(ex. One-Hot). Tu peux laisser des champs vides : ils seront imputés. "
+            "Les colonnes en trop sont ignorées."
+        )
         st.write(expected_cols if expected_cols else "—")
 
-    # Slider de seuil UI (pour visualiser sans changer la logique côté API)
+    # Slider de seuil UI (visualisation locale, ne change pas l'API)
     try:
         DEFAULT_T = float(health.get("threshold", 0.5))
     except Exception:
@@ -111,12 +169,30 @@ with col2:
         help="Utilisé seulement pour l'affichage local. L'API garde son propre seuil."
     )
 
+# —— Explication synthétique des indicateurs en haut ——
+model_name = str(health.get("used_model", "?"))
+thr = float(health.get("threshold", 0.5))
+st.info(
+    f"""
+**Que signifient ces indicateurs ?**
+
+- **API OK** : le serveur FastAPI est démarré et a chargé le modèle. L’endpoint `/health` répond correctement.
+- **Modèle** : `{model_name}`.  
+  *Exemple :* `isotonic` = régression logistique calibrée par régression isotone, pour obtenir des **probabilités mieux calibrées**.
+- **Seuil API** : **{thr:.2f}**.  
+  Règle de décision **côté serveur** : si `probabilité de défaut ≥ {thr:.2f}` ⇒ **refusé**, sinon ⇒ **accordé**.
+
+> 💡 Le **slider “Seuil décision (UI)”** à droite sert juste à **simuler** un seuil différent côté interface (il **ne change pas** la logique sur le serveur).
+"""
+)
+
 st.markdown("---")
 
 # =========================
-# Formulaire — mode simple + mode avancé (JSON)
+# 6) Formulaire — mode simple + mode avancé (JSON)
 # =========================
 st.subheader("🧾 Données client")
+
 with st.expander("Mode simple (tu peux laisser la plupart vides) ✅", expanded=True):
     colA, colB, colC, colD = st.columns(4)
     with colA:
@@ -171,7 +247,7 @@ with st.expander("Payload envoyé à l'API (aperçu)"):
     st.code(json.dumps(features, indent=2, ensure_ascii=False), language="json")
 
 # =========================
-# Actions
+# 7) Actions
 # =========================
 colL, colR = st.columns([1, 1])
 with colL:
@@ -180,7 +256,7 @@ with colR:
     do_explain = st.button("🪄 Expliquer (top contributions)")
 
 # =========================
-# Résultats - PREDICT
+# 8) Résultats - PREDICT
 # =========================
 if do_predict:
     try:
@@ -189,20 +265,19 @@ if do_predict:
         proba = float(pred.get("probability_default", 0.0))
         thresh_api = float(pred.get("threshold", 0.5))
 
-        # Affichage décision API
-        if decision_api == "accordé":
-            st.success(f"Décision API : **{decision_api}**  •  Probabilité défaut : **{proba:.3f}**  •  Seuil API : {thresh_api}")
-        else:
-            st.error(f"Décision API : **{decision_api}**  •  Probabilité défaut : **{proba:.3f}**  •  Seuil API : {thresh_api}")
+        cA, cB = st.columns([1, 1])
+        with cA:
+            st.subheader("Décision API")
+            decision_badge(decision_api)
+            st.caption(f"Seuil API : {thresh_api:.2f}")
+        with cB:
+            st.subheader("Décision (UI)")
+            t_ui = CUSTOM_T if CUSTOM_T is not None else thresh_api
+            decision_ui = "refusé" if proba >= t_ui else "accordé"
+            decision_badge(decision_ui)
+            st.caption(f"Seuil UI : {t_ui:.2f}")
 
-        # Décision locale avec le seuil choisi dans l'UI
-        t_ui = CUSTOM_T if CUSTOM_T is not None else thresh_api
-        decision_ui = "refusé" if proba >= t_ui else "accordé"
-
-        st.write("Probabilité de défaut (gauge)")
-        st.progress(int(round(proba * 100)))  # 0..100
-
-        st.info(f"Décision (UI) avec seuil {t_ui:.2f} : **{decision_ui}**")
+        gauge_prob(proba, title="Probabilité de défaut (%)")
 
         if pred.get("missing_features"):
             with st.expander("Variables manquantes imputées (info)"):
@@ -216,7 +291,7 @@ if do_predict:
         st.error(f"Erreur /predict : {e}")
 
 # =========================
-# Résultats - EXPLAIN
+# 9) Résultats - EXPLAIN
 # =========================
 if do_explain:
     try:
@@ -225,18 +300,19 @@ if do_explain:
         proba = float(expl.get("probability_default", 0.0))
         thresh_api = float(expl.get("threshold", 0.5))
 
-        if decision_api == "accordé":
-            st.success(f"Décision API : **{decision_api}**  •  Probabilité défaut : **{proba:.3f}**  •  Seuil API : {thresh_api}")
-        else:
-            st.error(f"Décision API : **{decision_api}**  •  Probabilité défaut : **{proba:.3f}**  •  Seuil API : {thresh_api}")
+        cA, cB = st.columns([1, 1])
+        with cA:
+            st.subheader("Décision API")
+            decision_badge(decision_api)
+            st.caption(f"Seuil API : {thresh_api:.2f}")
+        with cB:
+            st.subheader("Décision (UI)")
+            t_ui = CUSTOM_T if CUSTOM_T is not None else thresh_api
+            decision_ui = "refusé" if proba >= t_ui else "accordé"
+            decision_badge(decision_ui)
+            st.caption(f"Seuil UI : {t_ui:.2f}")
 
-        # Décision locale (UI)
-        t_ui = CUSTOM_T if CUSTOM_T is not None else thresh_api
-        decision_ui = "refusé" if proba >= t_ui else "accordé"
-        st.write("Probabilité de défaut (gauge)")
-        st.progress(int(round(proba * 100)))
-        st.info(f"Décision (UI) avec seuil {t_ui:.2f} : **{decision_ui}**")
-
+        gauge_prob(proba, title="Probabilité de défaut (%)")
         st.caption(f"Biais (intercept, log-odds) : {float(expl.get('bias', 0.0)):.4f}")
 
         contrib_df = pd.DataFrame(expl.get("top_contributions", []))
@@ -260,7 +336,7 @@ if do_explain:
         st.error(f"Erreur /explain : {e}")
 
 # =========================
-# Prédictions en lot (CSV)
+# 10) Prédictions en lot (CSV)
 # =========================
 st.markdown("---")
 st.subheader("📦 Prédictions en lot (CSV)")
