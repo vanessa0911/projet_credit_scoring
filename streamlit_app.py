@@ -1,702 +1,356 @@
 # streamlit_app.py
+# =========================================================
+# Tableau de bord scoring prês-metier
+# - API_URL robuste (sans secrets.toml obligatoire)
+# - Entête API: affiche chosen_model OU model_class
+# - Inputs client -> payload -> /predict
+# - Batch CSV -> /predict_proba_batch
+# - Comparaison population & cohortes si artifacts présents
+# =========================================================
+
+# 0) Page config: doit être le PREMIER appel Streamlit
+import streamlit as st
+st.set_page_config(
+    page_title="Prêt à dépenser — Scoring",
+    page_icon="💳",
+    layout="wide",
+)
+
+# 1) Imports standard
 import os
 import json
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
-import requests
-import pandas as pd
 import numpy as np
-import streamlit as st
+import pandas as pd
+import requests
+import plotly.graph_objects as go
 
-# --- Plotly (jauge / graphs) avec fallback si non disponible ---
-try:
-    import plotly.graph_objects as go
-    HAS_PLOTLY = True
-except Exception:
-    HAS_PLOTLY = False
-
-# =========================
-# 1) Page config — DOIT être la première commande Streamlit
-# =========================
-st.set_page_config(page_title="Prêt à dépenser — Scoring", page_icon="💳", layout="wide")
-
-# =========================
-# 2) Config API (ne lit st.secrets que si un secrets.toml existe)
-# =========================
-DEFAULT_API = "http://127.0.0.1:8000"  # API locale FastAPI
-API_URL = os.getenv("API_URL", DEFAULT_API)
-
-_SECRETS_PATHS = [
-    Path.home() / ".streamlit" / "secrets.toml",
-    Path.cwd() / ".streamlit" / "secrets.toml",
-]
-if any(p.exists() for p in _SECRETS_PATHS):
+# 2) API_URL robuste (pas d'erreur si secrets.toml absent)
+def get_api_url() -> str:
+    default = os.getenv("API_URL", "http://127.0.0.1:8000")
     try:
-        API_URL = st.secrets.get("API_URL", API_URL)
-    except Exception:
-        pass
-
-# =========================
-# 3) Utils
-# =========================
-def coerce_value(v: str):
-    """Convertit une saisie texte en int/float si possible, sinon string/None."""
-    if v is None:
-        return None
-    v = str(v).strip()
-    if v == "":
-        return None
-    try:
-        if v.isdigit() or (v[0] == "-" and v[1:].isdigit()):
-            return int(v)
-    except Exception:
-        pass
-    try:
-        return float(v.replace(",", "."))
-    except Exception:
-        pass
-    return v
-
-def years_to_days_negative(years) -> int | None:
-    """Convertit des années positives en jours négatifs (convention Home Credit)."""
-    if years is None or years == "":
-        return None
-    try:
-        y = float(years)
-    except Exception:
-        return None
-    if y < 0:
-        y = 0.0
-    if y > 120:
-        y = 120.0
-    return int(round(-y * 365.25))
-
-def decision_badge(text: str):
-    """Badge coloré pour décision (métier-friendly)."""
-    text = (text or "").lower().strip()
-    if text == "accordé":
-        color_bg, color_text = "#16a34a", "white"
-        label = "ACCORDÉ"
-    elif text == "refusé":
-        color_bg, color_text = "#dc2626", "white"
-        label = "REFUSÉ"
-    else:
-        color_bg, color_text = "#6b7280", "white"
-        label = text.upper() if text else "?"
-    st.markdown(
-        f"<span style='display:inline-block;padding:6px 10px;border-radius:14px;"
-        f"background:{color_bg};color:{color_text};font-weight:700;letter-spacing:.3px;'>{label}</span>",
-        unsafe_allow_html=True
-    )
-
-def risk_chip(prob: float):
-    """Catégorie de risque simple pour non-data (faible/modéré/élevé)."""
-    p = float(prob)
-    if p < 0.10:
-        label, bg = "Risque FAIBLE", "#16a34a"
-    elif p < 0.30:
-        label, bg = "Risque MODÉRÉ", "#f59e0b"
-    else:
-        label, bg = "Risque ÉLEVÉ", "#dc2626"
-    st.markdown(
-        f"<span style='display:inline-block;padding:6px 10px;border-radius:14px;"
-        f"background:{bg};color:white;font-weight:700;'>{label}</span>",
-        unsafe_allow_html=True
-    )
-
-def gauge_prob(prob: float, title: str = "Probabilité défaut (%)"):
-    """Jauge Plotly 0-100% avec fallback Streamlit si Plotly indisponible."""
-    prob = max(0.0, min(1.0, float(prob)))
-    if not HAS_PLOTLY:
-        st.write(title)
-        st.progress(int(round(prob * 100)))
-        st.caption("⚠️ Plotly non disponible — affichage simplifié.")
-        return
-
-    val = prob * 100.0
-    fig = go.Figure(
-        go.Indicator(
-            mode="gauge+number",
-            value=val,
-            number={'suffix': "%", 'valueformat': ".1f"},
-            title={'text': title},
-            gauge={
-                'axis': {'range': [0, 100]},
-                'bar': {'thickness': 0.35},
-                'steps': [
-                    {'range': [0, 20], 'color': '#dcfce7'},
-                    {'range': [20, 40], 'color': '#bbf7d0'},
-                    {'range': [40, 60], 'color': '#fef3c7'},
-                    {'range': [60, 80], 'color': '#fdba74'},
-                    {'range': [80, 100], 'color': '#fecaca'},
-                ],
-            }
-        )
-    )
-    fig.update_layout(margin=dict(l=30, r=30, t=60, b=10), height=260)
-    st.plotly_chart(fig, use_container_width=True)
-
-def nice_feature_name(raw: str) -> str:
-    mapping = {
-        "AMT_CREDIT": "Montant du crédit",
-        "AMT_INCOME_TOTAL": "Revenu total",
-        "DAYS_BIRTH": "Âge (jours négatifs)",
-        "DAYS_EMPLOYED": "Ancienneté emploi (jours négatifs)",
-        "DAYS_REGISTRATION": "Ancienneté d’enregistrement (jours négatifs)",
-        "CNT_CHILDREN": "Nombre d’enfants",
-        "CNT_FAM_MEMBERS": "Membres du foyer",
-        "CODE_GENDER": "Sexe",
-        "NAME_EDUCATION_TYPE": "Niveau d’études",
-        "NAME_FAMILY_STATUS": "Situation familiale",
-        "NAME_CONTRACT_TYPE": "Type de contrat",
-        "NAME_INCOME_TYPE": "Type de revenu",
-        "NAME_HOUSING_TYPE": "Logement",
-        "REGION_RATING_CLIENT": "Indice région client (1=meilleur)",
-        "FLAG_OWN_CAR": "Possède une voiture",
-        "FLAG_OWN_REALTY": "Possède un bien immobilier",
-        "OCCUPATION_TYPE": "Métier",
-    }
-    return mapping.get(raw, raw)
-
-def percentile_from_hist(x: float, edges: list, counts: list) -> float:
-    edges = np.array(edges, dtype=float)
-    counts = np.array(counts, dtype=float)
-    if edges.ndim != 1 or counts.ndim != 1 or edges.size != counts.size + 1:
-        return float("nan")
-    total = counts.sum()
-    if total <= 0:
-        return float("nan")
-    bin_idx = np.searchsorted(edges, x, side="right") - 1
-    bin_idx = int(np.clip(bin_idx, 0, counts.size - 1))
-    cum_before = counts[:bin_idx].sum()
-    left, right = edges[bin_idx], edges[bin_idx + 1]
-    width = max(1e-12, right - left)
-    frac_in_bin = np.clip((x - left) / width, 0.0, 1.0)
-    num_in_bin = counts[bin_idx] * frac_in_bin
-    cdf = (cum_before + num_in_bin) / total
-    return float(cdf * 100.0)
-
-def z_from_mean_std(x: float, mean: float, std: float) -> float:
-    if std and std > 0:
-        return float((x - mean) / std)
-    return 0.0
-
-def format_number_fr(x: float, decimals: int = 0) -> str:
-    try:
-        if decimals == 0:
-            return f"{x:,.0f}".replace(",", " ").replace("\xa0", " ")
-        return f"{x:,.{decimals}f}".replace(",", " ").replace("\xa0", " ")
-    except Exception:
-        return str(x)
-
-def days_to_years_positive(days: float | int) -> float:
-    try:
-        d = float(days)
-    except Exception:
-        return float("nan")
-    return round(abs(d) / 365.25, 1)
-
-def interpret_sentence(feat: str, value: float, perc: float, z: float, mean: float, std: float) -> str:
-    f_nice = nice_feature_name(feat)
-    if np.isnan(perc):
-        pos_txt = "Position par rapport à la population : non disponible."
-    else:
-        if perc < 45:
-            pos_txt = f"{f_nice} plus bas que ~{int(round(100 - perc))}% de la population."
-        elif perc > 55:
-            pos_txt = f"{f_nice} plus élevé que ~{int(round(perc))}% de la population."
-        else:
-            pos_txt = f"{f_nice} proche de la moyenne de la population."
-    if z >= 0.2:
-        z_txt = f"{abs(z):.2f} écart-type au-dessus de la moyenne."
-    elif z <= -0.2:
-        z_txt = f"{abs(z):.2f} écart-type en dessous de la moyenne."
-    else:
-        z_txt = "très proche de la moyenne."
-    val_txt = None
-    if feat in ("DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_REGISTRATION"):
-        yrs = days_to_years_positive(value)
-        label = {
-            "DAYS_BIRTH": "≈ âge",
-            "DAYS_EMPLOYED": "≈ ancienneté emploi",
-            "DAYS_REGISTRATION": "≈ ancienneté d’enregistrement"
-        }[feat]
-        if not np.isnan(yrs):
-            val_txt = f"({label} ≈ {yrs:.1f} an(s))."
-    sent = f"{pos_txt} Écart à la moyenne : {z_txt}"
-    if val_txt:
-        sent += f" {val_txt}"
-    return sent
-
-# =========================
-# 4) Appels API
-# =========================
-@st.cache_data(show_spinner=False, ttl=60)
-def get_health():
-    try:
-        r = requests.get(f"{API_URL}/health", timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        return {"status": "ko", "error": str(e)}
-
-def call_predict(features: dict):
-    r = requests.post(f"{API_URL}/predict", json={"features": features}, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-@st.cache_data(show_spinner=False, ttl=600)
-def get_ref_stats():
-    try:
-        r = requests.get(f"{API_URL}/ref_stats", timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("available"):
-            return None
-        return data["stats"]
-    except Exception:
-        return None
-
-# =========================
-# 5) En-tête (métier-friendly)
-# =========================
-st.title("💳 Prêt à dépenser — Dashboard de scoring")
-st.markdown(
-    """
-    <div style="
-        padding:14px 16px;
-        background:#F3F4F6;
-        border-left:6px solid #10B981;
-        border-radius:8px;
-        line-height:1.55;
-    ">
-      <div style="font-weight:700; font-size:17px; margin-bottom:6px;">
-        🤝 Notre engagement
-      </div>
-      <div style="font-size:15px;">
-        Derrière chaque demande de crédit, il y a une personne et un projet de vie. Notre rôle est d’<strong>accompagner</strong> avec bienveillance et clarté.
-        Ce tableau de bord s’appuie sur des <strong>modèles statistiques</strong> qui estiment une probabilité de défaut à partir d’informations objectives : 
-        ils ne jugent pas, ils aident à <strong>protéger</strong> à la fois nos clients et la banque contre un endettement excessif.<br><br>
-        Un <strong>refus automatique</strong> n’est jamais une fin : il ouvre un échange pour vérifier les données, comprendre la situation, 
-        ajuster le montant ou la durée, ou proposer des alternatives. La <strong>décision finale</strong> appartient au conseiller, pas à l’algorithme.
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.markdown("---")
-
-# =========================
-# 6) SIDEBAR — Panneau technique, seuil UI, batch & payload
-# =========================
-with st.sidebar:
-    st.header("🔧 Panneau technique")
-    health = get_health()
-    if health.get("status") == "ok":
-        st.success("API OK", icon="✅")
-        st.caption(f"Modèle : {health.get('used_model')} • Seuil API : {float(health.get('threshold', 0.5)):.2f}")
-    else:
-        st.error("API non joignable.", icon="⚠️")
-        st.caption("Vérifie que `uvicorn api:app --reload` tourne et que l'URL est correcte.")
-    st.caption(f"Endpoint : `{API_URL}`")
-
-    # Seuil UI (explication claire)
-    try:
-        DEFAULT_T = float(health.get("threshold", 0.5)) if health.get("status") == "ok" else 0.5
-    except Exception:
-        DEFAULT_T = 0.5
-    ui_threshold = st.slider(
-        "Seuil décision (UI)",
-        min_value=0.0, max_value=1.0, value=DEFAULT_T, step=0.01,
-        help=(
-            "Ce curseur **ne modifie pas** l’API. Il sert uniquement à **simuler** une politique locale : "
-            "si la probabilité de défaut affichée est **au-dessus** de ce seuil, la décision simulée serait un refus. "
-            "Le **seuil API** affiché plus haut est celui réellement utilisé par le service de scoring."
-        )
-    )
-
-    st.divider()
-
-    # 📦 Prédictions en lot (CSV) — maintenant dans la sidebar
-    st.subheader("📦 Prédictions en lot (CSV)")
-    st.caption("Dépose un CSV (colonnes brutes attendues par l’API). Les valeurs manquantes seront imputées côté modèle.")
-    uploaded = st.file_uploader("CSV", type=["csv"], key="batch_csv_sidebar")
-    max_rows_batch = st.number_input("Max lignes à traiter", min_value=1, max_value=5000, value=100, step=10)
-    if st.button("Lancer les prédictions (lot)"):
-        if uploaded is None:
-            st.warning("Dépose d’abord un fichier CSV.")
-        else:
+        home_secrets = Path.home() / ".streamlit" / "secrets.toml"
+        proj_secrets = Path.cwd() / ".streamlit" / "secrets.toml"
+        # On ne lit st.secrets QUE si un fichier existe réellement
+        if home_secrets.exists() or proj_secrets.exists():
             try:
-                df_batch = pd.read_csv(uploaded)
-                rows = df_batch.head(int(max_rows_batch))
-                results = []
-                with st.spinner("Prédictions en cours..."):
-                    for _, row in rows.iterrows():
-                        feat = {col: (None if pd.isna(row[col]) else row[col]) for col in rows.columns}
-                        try:
-                            pred = call_predict(feat)
-                            results.append({
-                                **{k: feat.get(k) for k in feat},
-                                "probability_default": pred.get("probability_default"),
-                                "decision_api": pred.get("decision"),
-                                "threshold_api": pred.get("threshold"),
-                            })
-                        except Exception as e:
-                            results.append({**feat, "error": str(e)})
-                out_df = pd.DataFrame(results)
-                st.success(f"Terminé. {len(out_df)} lignes.")
-                # Petit aperçu
-                st.dataframe(out_df.head(10), use_container_width=True, height=250)
-                # Téléchargement
-                csv_bytes = out_df.to_csv(index=False).encode("utf-8")
-                st.download_button("💾 Télécharger résultats (CSV)", csv_bytes, file_name="predictions_batch.csv", mime="text/csv")
-            except Exception as e:
-                st.error(f"Lecture/traitement impossible : {e}")
+                return st.secrets.get("API_URL", default)  # type: ignore[attr-defined]
+            except Exception:
+                return default
+        return default
+    except Exception:
+        return default
 
-    st.divider()
+API_URL = get_api_url()
 
-    # 🧩 Payload → API — affiché seulement si noyau de variables complété
-    st.subheader("🧩 Payload → API")
-    st.caption("Aperçu des données réellement envoyées à l’API (affiché quand les variables clés sont renseignées).")
-    payload_container = st.container()
+# 3) Utils HTTP
+def http_get_json(url: str, timeout: int = 6) -> Tuple[bool, Dict[str, Any], str]:
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return True, r.json(), ""
+    except Exception as e:
+        return False, {}, str(e)
 
-# =========================
-# 7) Formulaire — Informations client (années positives)
-# =========================
-st.subheader("🧾 Informations client")
+def http_post_json(url: str, payload: Dict[str, Any], timeout: int = 10) -> Tuple[bool, Dict[str, Any], str]:
+    try:
+        r = requests.post(url, json=payload, timeout=timeout)
+        r.raise_for_status()
+        return True, r.json(), ""
+    except Exception as e:
+        # Essayer de lire réponse JSON d’erreur pour debug
+        try:
+            return False, r.json(), str(e)  # type: ignore[name-defined]
+        except Exception:
+            return False, {}, str(e)
 
-with st.expander("Informations client", expanded=True):
-    colA, colB, colC, colD = st.columns(4)
-    with colA:
-        CODE_GENDER = st.selectbox("CODE_GENDER", ["", "F", "M"])
-        NAME_EDUCATION_TYPE = st.selectbox(
-            "NAME_EDUCATION_TYPE",
-            ["", "Secondary / secondary special", "Higher education", "Incomplete higher", "Lower secondary", "Academic degree"]
-        )
-        NAME_FAMILY_STATUS = st.selectbox(
-            "NAME_FAMILY_STATUS",
-            ["", "Married", "Single / not married", "Civil marriage", "Separated", "Widow"]
-        )
-    with colB:
-        AMT_CREDIT = st.text_input("AMT_CREDIT (montant crédit)", value="150000", help="Montant du prêt demandé (ex: 150000)")
-        AMT_INCOME_TOTAL = st.text_input("AMT_INCOME_TOTAL (revenu)", value="", help="Revenu annuel brut")
-    with colC:
-        AGE_YEARS = st.number_input("Âge (années, positif)", min_value=0.0, max_value=120.0, value=38.0, step=0.5, help="Saisi en années positives (sera converti en jours négatifs).")
-        EMPLOY_YEARS = st.number_input("Ancienneté emploi (années, positif)", min_value=0.0, max_value=60.0, value=5.0, step=0.5, help="Saisi en années positives (converti en jours négatifs).")
-    with colD:
-        CNT_CHILDREN = st.text_input("CNT_CHILDREN", value="", help="Nombre d'enfants à charge")
-        NAME_CONTRACT_TYPE = st.selectbox("NAME_CONTRACT_TYPE", ["", "Cash loans", "Revolving loans"], help="Type de produit")
-
-with st.expander("Informations complémentaires (optionnelles)", expanded=False):
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        NAME_INCOME_TYPE = st.selectbox(
-            "NAME_INCOME_TYPE",
-            ["", "Working", "Commercial associate", "State servant", "Pensioner", "Unemployed", "Student", "Maternity leave"]
-        )
-        NAME_HOUSING_TYPE = st.selectbox(
-            "NAME_HOUSING_TYPE",
-            ["", "House / apartment", "With parents", "Municipal apartment", "Rented apartment", "Office apartment", "Co-op apartment"]
-        )
-    with col2:
-        FLAG_OWN_CAR_BOOL = st.selectbox("FLAG_OWN_CAR", ["", "Oui", "Non"])
-        FLAG_OWN_REALTY_BOOL = st.selectbox("FLAG_OWN_REALTY", ["", "Oui", "Non"])
-        CNT_FAM_MEMBERS = st.text_input("CNT_FAM_MEMBERS", value="")
-    with col3:
-        REG_YEARS = st.number_input("Ancienneté d’enregistrement (années, positif)", min_value=0.0, max_value=60.0, value=2.0, step=0.5, help="Saisi en années positives (converti en jours négatifs).")
-        REGION_RATING_CLIENT = st.selectbox("REGION_RATING_CLIENT", ["", 1, 2, 3])
-    with col4:
-        OCCUPATION_TYPE = st.selectbox(
-            "OCCUPATION_TYPE",
-            ["", "Laborers", "Sales staff", "Core staff", "Managers", "Drivers", "High skill tech staff", "Accountants", "Security staff", "Cooking staff", "Cleaning staff", "Private service staff", "Medicine staff", "HR staff", "IT staff"]
-        )
-
-def yn(val):
-    if val == "Oui":
-        return "Y"
-    if val == "Non":
-        return "N"
+# 4) Chargement d’artefacts locaux (optionnels)
+@st.cache_data(show_spinner=False)
+def load_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
     return None
 
-DAYS_BIRTH = years_to_days_negative(AGE_YEARS)
-DAYS_EMPLOYED = years_to_days_negative(EMPLOY_YEARS)
-DAYS_REGISTRATION = years_to_days_negative(REG_YEARS)
+ARTIFACT_DIR = Path("artifacts")
+REF_STATS = load_json_if_exists(ARTIFACT_DIR / "ref_stats.json")   # stats population
+SEG_STATS = load_json_if_exists(ARTIFACT_DIR / "seg_stats.json")   # stats cohortes
+GLOBAL_IMP = None
+try:
+    gi_path = ARTIFACT_DIR / "global_importance.csv"
+    if gi_path.exists():
+        GLOBAL_IMP = pd.read_csv(gi_path)
+except Exception:
+    GLOBAL_IMP = None
 
-features = {
-    "CODE_GENDER": CODE_GENDER or None,
-    "NAME_EDUCATION_TYPE": NAME_EDUCATION_TYPE or None,
-    "NAME_FAMILY_STATUS": NAME_FAMILY_STATUS or None,
-    "AMT_CREDIT": coerce_value(AMT_CREDIT),
-    "AMT_INCOME_TOTAL": coerce_value(AMT_INCOME_TOTAL),
-    "DAYS_BIRTH": DAYS_BIRTH,
-    "DAYS_EMPLOYED": DAYS_EMPLOYED,
-    "CNT_CHILDREN": coerce_value(CNT_CHILDREN),
-    "NAME_CONTRACT_TYPE": NAME_CONTRACT_TYPE or None,
-    "NAME_INCOME_TYPE": NAME_INCOME_TYPE or None,
-    "NAME_HOUSING_TYPE": NAME_HOUSING_TYPE or None,
-    "FLAG_OWN_CAR": yn(FLAG_OWN_CAR_BOOL),
-    "FLAG_OWN_REALTY": yn(FLAG_OWN_REALTY_BOOL),
-    "CNT_FAM_MEMBERS": coerce_value(CNT_FAM_MEMBERS),
-    "DAYS_REGISTRATION": DAYS_REGISTRATION,
-    "REGION_RATING_CLIENT": coerce_value(str(REGION_RATING_CLIENT) if REGION_RATING_CLIENT != "" else ""),
-    "OCCUPATION_TYPE": OCCUPATION_TYPE or None,
-}
+# 5) En-tête chaleureux & état API
+st.markdown("### 💬 Notre engagement")
+st.info(
+    "Derrière chaque dossier, il y a une personne. Notre rôle est d’accompagner au mieux, "
+    "avec des indicateurs **statistiques** conçus pour protéger à la fois nos clients et la banque. "
+    "Une décision négative n’est jamais punitive : elle évite un risque de surendettement et oriente vers des solutions adaptées."
+)
 
-# Affichage conditionnel du payload (variables clés complétées)
-required_core = {
-    "AMT_CREDIT": features.get("AMT_CREDIT"),
-    "AMT_INCOME_TOTAL": features.get("AMT_INCOME_TOTAL"),
-    "DAYS_BIRTH": features.get("DAYS_BIRTH"),
-}
-core_ok = all(v is not None and v != "" for v in required_core.values())
-
-with st.sidebar:
-    with payload_container:
-        if core_ok:
-            st.code(json.dumps(features, indent=2, ensure_ascii=False), language="json")
+with st.container():
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        st.subheader("État de l’API")
+        ok, root_json, err = http_get_json(f"{API_URL}/")
+        if not ok:
+            st.error(f"API non joignable. Lance `python -m uvicorn api:app --reload`.\n\nEndpoint : {API_URL}\n\n{err}")
+            status = {}
         else:
-            st.info("Complète au moins : **Montant du crédit**, **Revenu total**, **Âge** (années) pour afficher le payload.")
+            status = root_json
+            # label modèle (chosen_model sinon model_class sinon "?")
+            model_label = status.get("chosen_model") or status.get("model_class") or "?"
+            dt = status.get("decision_threshold")
+            st.success(f"API ✅ • **Modèle** : {model_label} • **Seuil API** : {dt}")
 
-# =========================
-# 8) Actions
-# =========================
-colL, colR = st.columns([1, 1])
-with colL:
-    do_predict = st.button("🔮 Prédire")
-with colR:
-    do_clear = st.button("🧹 Réinitialiser la saisie")
+    with c2:
+        st.subheader("Fiche décision (aperçu)")
+        st.caption("Renseigne les informations client ci-dessous, puis clique sur **Évaluer ce dossier**.")
 
-if do_clear:
-    st.experimental_rerun()
+st.markdown("---")
 
-# =========================
-# 9) Résultats - PREDICT + recommandations
-# =========================
-ref_stats = get_ref_stats()
+# 6) Sidebar — bloc technique + payload + batch
+with st.sidebar:
+    st.markdown("### ⚙️ Technique (Data/DS)")
+    st.caption("Ces informations sont utiles au suivi technique, pas indispensables au métier.")
 
-def feature_percentile(ref_stats: dict, feat: str, value) -> float | None:
-    if ref_stats is None or value is None:
+    # API URL paramétrable (optionnel)
+    api_url_input = st.text_input("API URL", API_URL, help="Modifie l’URL si l’API est déployée ailleurs.")
+    if api_url_input != API_URL:
+        API_URL = api_url_input  # mise à jour live
+
+    # Récup colonnes attendues pour assembler un payload complet (clé → None par défaut)
+    @st.cache_data(ttl=30, show_spinner=False)
+    def get_expected_cols() -> Optional[list[str]]:
+        okc, js, _ = http_get_json(f"{API_URL}/expected_columns")
+        if okc and isinstance(js, dict) and "columns" in js:
+            return list(js["columns"])
         return None
-    feats = ref_stats.get("features", {})
-    fs = feats.get(feat)
-    if not fs:
-        return None
-    hist = fs.get("hist", {})
-    edges, counts = hist.get("edges"), hist.get("counts")
-    if not edges or not counts:
+
+    exp_cols = get_expected_cols()
+
+    st.markdown("#### 🧩 Payload → API")
+    st.caption("Aperçu du JSON envoyé à l’API (affiché quand les champs principaux sont saisis).")
+
+# 7) Zone informations client (inputs)
+st.markdown("### 🧾 Informations client")
+
+# Aides : convertir les jours négatifs → années positives (métier)
+def days_to_years_positive(days: Optional[float]) -> Optional[float]:
+    if days is None:
         return None
     try:
-        return percentile_from_hist(float(value), edges, counts)
+        return round(abs(float(days)) / 365.25, 2)
     except Exception:
         return None
 
-def z_from_stats(ref_stats: dict, feat: str, value) -> float | None:
-    if ref_stats is None or value is None:
-        return None
-    fs = ref_stats.get("features", {}).get(feat, {})
-    mean, std = fs.get("mean"), fs.get("std")
-    try:
-        return z_from_mean_std(float(value), float(mean), float(std))
-    except Exception:
-        return None
+# Champs essentiels (tu peux en ajouter selon ton modèle)
+c1, c2, c3 = st.columns(3)
+with c1:
+    amt_income = st.number_input("Revenu annuel (AMT_INCOME_TOTAL)", min_value=0.0, step=1000.0, format="%.0f")
+    amt_credit = st.number_input("Montant du crédit (AMT_CREDIT)", min_value=0.0, step=1000.0, format="%.0f")
+with c2:
+    days_birth = st.number_input("Âge (en jours, négatif dans les données)", value=-14000.0, step=100.0, help="Valeur Kaggle d’origine (jours négatifs).", format="%.0f")
+    age_years   = days_to_years_positive(days_birth)
+    st.caption(f"Âge estimé ≈ **{age_years if age_years is not None else '?'}** ans")
+with c3:
+    days_employed = st.number_input("Ancienneté emploi (DAYS_EMPLOYED, jours négatifs)", value=-2000.0, step=50.0, format="%.0f")
+    emp_years     = days_to_years_positive(days_employed)
+    st.caption(f"Ancienneté estimée ≈ **{emp_years if emp_years is not None else '?'}** ans")
 
-def build_recommendations(pred_proba: float, thr: float, feats: dict, ref_stats: dict, missing_count: int) -> list[str]:
-    recs = []
-    margin = pred_proba - thr
-    if pred_proba < thr - 0.10:
-        recs.append("Le dossier est **confortablement sous le seuil** : un accord est probable sous réserve des vérifications usuelles.")
-    elif abs(margin) <= 0.03:
-        recs.append("Le score est **proche du seuil** : un examen manuel est recommandé (justificatifs, cohérence des montants, stabilité).")
+# Quelques compléments utiles
+cc1, cc2, cc3 = st.columns(3)
+with cc1:
+    children = st.number_input("Nombre d’enfants (CNT_CHILDREN)", min_value=0, step=1)
+with cc2:
+    annuity  = st.number_input("Annuité (AMT_ANNUITY)", min_value=0.0, step=500.0, format="%.0f")
+with cc3:
+    contract = st.selectbox("Type de contrat (NAME_CONTRACT_TYPE)", ["", "Cash loans", "Revolving loans"])
+
+# 8) Construire le payload harmonisé aux colonnes attendues (si dispos)
+def build_payload() -> Dict[str, Any]:
+    # Champs “métier” utilisés souvent par les modèles
+    base = {
+        "AMT_INCOME_TOTAL": None if amt_income == 0 else amt_income,
+        "AMT_CREDIT":       None if amt_credit == 0 else amt_credit,
+        "DAYS_BIRTH":       None if days_birth == 0 else days_birth,           # on envoie la VRAIE valeur (jours négatifs)
+        "DAYS_EMPLOYED":    None if days_employed == 0 else days_employed,     # idem
+        "CNT_CHILDREN":     None if children == 0 else int(children),
+        "AMT_ANNUITY":      None if annuity == 0 else annuity,
+        "NAME_CONTRACT_TYPE": contract if contract else None,
+        # Ajoute ici d’autres colonnes si ton modèle les attend…
+    }
+    # Si l’API fournit la liste exacte des colonnes attendues, on la respecte
+    if exp_cols:
+        payload = {col: base.get(col, None) for col in exp_cols}
+        return payload
+    return base
+
+payload = build_payload()
+
+# Afficher payload dans la sidebar UNIQUEMENT si valeurs clés sont remplies
+with st.sidebar:
+    show_preview = any([
+        payload.get("AMT_INCOME_TOTAL") not in (None, 0, ""),
+        payload.get("AMT_CREDIT") not in (None, 0, ""),
+        payload.get("DAYS_BIRTH") not in (None, 0, ""),
+    ])
+    if show_preview:
+        st.json({"data": {k: v for k, v in payload.items() if v is not None}})
     else:
-        recs.append("Le score est **au-dessus du seuil de risque** : privilégier un ajustement du dossier avant re-soumission.")
-    if missing_count > 0:
-        recs.append("Certaines informations sont manquantes : **compléter les données** ou fournir des justificatifs pour améliorer l’évaluation.")
-    if ref_stats:
-        p_income = feature_percentile(ref_stats, "AMT_INCOME_TOTAL", feats.get("AMT_INCOME_TOTAL"))
-        p_credit = feature_percentile(ref_stats, "AMT_CREDIT", feats.get("AMT_CREDIT"))
-        if p_credit is not None and p_credit >= 70:
-            recs.append("**Réduire le montant du crédit** (par ex. −10 à −20%) ou **allonger la durée** pour diminuer la charge mensuelle.")
-        if p_income is not None and p_income <= 40:
-            recs.append("**Renforcer la preuve de revenus** (bulletins, avis d’imposition) ou **ajouter un co-emprunteur**.")
-        de = feats.get("DAYS_EMPLOYED")
-        try:
-            de = float(de) if de is not None else None
-        except Exception:
-            de = None
-        if de is not None and de > -365:
-            recs.append("Ancienneté professionnelle récente : **attendre quelques mois** ou **fournir un CDI/contrat** peut aider.")
-    if len(recs) < 2:
-        recs.append("Vérifier l’exactitude des informations (dates, montants) et **fournir les derniers justificatifs**.")
-        recs.append("Envisager **co-emprunteur** ou **garant** si disponible.")
-    return recs
+        st.caption("Renseigne au moins revenu, crédit et âge pour voir l’aperçu du payload.")
+
+# 9) Bouton Évaluer ce dossier → /predict
+st.markdown("### 🧮 Évaluation")
+left, right = st.columns([1, 3])
+with left:
+    do_predict = st.button("Évaluer ce dossier", type="primary")
+with right:
+    st.caption("Compare automatiquement la probabilité de défaut au **seuil API** pour proposer une décision.")
 
 if do_predict:
-    try:
-        pred = call_predict(features)
-        decision_api = pred.get("decision", "?")
-        proba = float(pred.get("probability_default", 0.0))
-        thresh_api = float(pred.get("threshold", 0.5))
-        missing = pred.get("missing_features", [])
-
-        cA, cB, cC = st.columns([1, 1, 1.2])
-        with cA:
-            st.subheader("Décision API")
-            decision_badge(decision_api)
-            st.caption(f"Seuil API : {thresh_api:.2f}")
-        with cB:
-            st.subheader("Catégorie de risque")
-            risk_chip(proba)
-            st.caption(f"Probabilité défaut : {proba:.3f}")
-        with cC:
-            st.subheader("Qualité des données")
-            # On n'a plus expected_features ici — on utilise les manquants retournés par l’API
-            total_keys = len([k for k, v in features.items() if v is not None])
-            # Approximation : ratio de champs fournis parmi ceux envoyés
-            ratio = 1.0 if total_keys == 0 else 1.0 - (len(missing) / max(1, total_keys))
-            st.progress(int(round(max(0.0, min(1.0, ratio)) * 100)))
-            st.caption(f"Champs fournis ou imputés : {int(round(max(0.0, min(1.0, ratio))*100))}%")
-
-        gauge_prob(proba, title="Probabilité de défaut (%)")
-
-        # Décision simulée locale (UI)
-        st.info(
-            f"**Décision simulée (UI)** avec seuil {ui_threshold:.2f} : "
-            + ("REFUSÉ" if proba >= ui_threshold else "ACCORDÉ")
-            + " • Cette simulation n’affecte pas la décision de l’API.",
-            icon="🧪"
-        )
-
-        st.markdown("### 🧭 Explication de la décision & recommandations")
-        ref_stats_local = ref_stats or get_ref_stats()
-        if ref_stats_local:
-            feats_stats = ref_stats_local.get("features", {})
-            default_feats = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_REGISTRATION", "CNT_CHILDREN"]
-            available_feats = sorted(list(feats_stats.keys()))
-            preselect = [f for f in default_feats if f in available_feats][:6]
-            st.caption("Affichage d’un sous-ensemble de variables. Utilise le sélecteur ci-dessous pour en ajouter.")
-            selected_feats = st.multiselect(
-                "Variables à afficher (comparaison à la population)",
-                options=available_feats,
-                default=preselect,
-                help="Ajoute/retire des variables à comparer à la population de référence."
-            )
-            st.caption(f"Affichées : {len(selected_feats)} / {len(available_feats)} variables disponibles.")
-            if len(available_feats) > len(selected_feats):
-                with st.expander("Voir les autres variables disponibles"):
-                    others = [nice_feature_name(f) for f in available_feats if f not in selected_feats]
-                    st.write(", ".join(others) if others else "—")
-
-            if selected_feats:
-                ccols = st.columns(min(6, len(selected_feats)))
-                for idx, f in enumerate(selected_feats):
-                    val = features.get(f)
-                    if val is None:
-                        continue
-                    fs = feats_stats[f]
-                    mean, std = float(fs.get("mean", 0.0)), float(fs.get("std", 0.0))
-                    hist = fs.get("hist", {})
-                    edges, counts = hist.get("edges", []), hist.get("counts", [])
-                    perc = percentile_from_hist(float(val), edges, counts) if (edges and counts) else float("nan")
-                    z = z_from_mean_std(float(val), mean, std)
-                    with ccols[idx % len(ccols)]:
-                        # Affichage en années positives pour DAYS_*
-                        if f in ("DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_REGISTRATION"):
-                            yrs = days_to_years_positive(val)
-                            st.metric(label=nice_feature_name(f) + " (≈ années)", value=f"{yrs:.1f} an(s)" if not np.isnan(yrs) else "—")
-                            st.caption(f"Valeur brute : {int(val)} jours (négatifs = passé)")
-                        else:
-                            st.metric(label=nice_feature_name(f), value=f"{val}")
-                        st.write(interpret_sentence(f, float(val), perc, z, mean, std))
-
-        recs = build_recommendations(proba, thresh_api, features, ref_stats, len(missing))
-        st.write("\n".join([f"• {r}" for r in recs]))
-
-        result_json = json.dumps(pred, indent=2, ensure_ascii=False)
-        st.download_button("💾 Télécharger le résultat (JSON)", result_json, file_name="prediction.json", mime="application/json")
-
-    except Exception as e:
-        st.error(f"Erreur /predict : {e}")
-
-# =========================
-# 10) 📊 Comparaison avec la population (référence = jeu d’entraînement)
-# =========================
-st.markdown("---")
-st.subheader("📊 Comparaison avec la population (référence = jeu d’entraînement)")
-
-ref_stats = ref_stats or get_ref_stats()
-if not ref_stats:
-    st.warning("Stats de référence indisponibles. Lance `make_ref_stats.py` puis redémarre l’API.")
-else:
-    feats_stats = ref_stats.get("features", {})
-    available_feats = sorted(list(feats_stats.keys()))
-    default_feats = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_REGISTRATION", "CNT_CHILDREN"]
-    preselect = [f for f in default_feats if f in available_feats][:6]
-
-    st.caption("Affichage d’un sous-ensemble de variables. Utilise le sélecteur ci-dessous pour en ajouter/retirer.")
-    selected_feats = st.multiselect(
-        "Variables à afficher (section récapitulée)",
-        options=available_feats,
-        default=preselect,
-        help="Choisis les variables à illustrer dans cette section."
-    )
-    st.caption(f"Affichées : {len(selected_feats)} / {len(available_feats)} variables disponibles.")
-    if len(available_feats) > len(selected_feats):
-        with st.expander("Voir les autres variables disponibles"):
-            others = [nice_feature_name(f) for f in available_feats if f not in selected_feats]
-            st.write(", ".join(others) if others else "—")
-
-    client_vals = features if isinstance(features, dict) else {}
-    if not selected_feats:
-        st.info("Aucune variable sélectionnée pour l’affichage.")
+    ok, pred_json, err = http_post_json(f"{API_URL}/predict", {"data": payload})
+    if not ok:
+        st.error(f"Erreur /predict : {err}\n\nRéponse: {pred_json}")
     else:
-        for f in selected_feats:
-            st.markdown(f"**{nice_feature_name(f)}**")
-            if client_vals.get(f) is None:
-                st.caption("Valeur client inconnue → positionnement impossible.")
-                continue
+        proba = pred_json.get("probability_default")
+        decision = pred_json.get("decision")
+        thr = pred_json.get("threshold_used")
+        if proba is None:
+            st.warning(f"Réponse inattendue: {pred_json}")
+        else:
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                st.metric("Probabilité de défaut", f"{proba:.2%}")
+                st.metric("Décision", "❌ Refus" if decision == "reject" else "✅ Acceptation")
+            with c2:
+                st.write("**Seuil utilisé (API)**")
+                st.json(thr)
 
-            try:
-                val = float(client_vals[f])
-            except Exception:
-                st.caption("Valeur non numérique — positionnement impossible.")
-                continue
-
-            fs = feats_stats[f]
-            mean, std = float(fs.get("mean", 0.0)), float(fs.get("std", 0.0))
-            hist = fs.get("hist", {})
-            edges, counts = hist.get("edges", []), hist.get("counts", [])
-
-            perc = percentile_from_hist(val, edges, counts) if (edges and counts) else float("nan")
-            z = z_from_mean_std(val, mean, std)
-
-            trend = "au-dessus de la moyenne" if (not np.isnan(z) and z > 0) else "en dessous de la moyenne"
-            st.caption(f"Position : **p{0 if np.isnan(perc) else int(round(perc))}** ({trend}, z = {z:.2f}) • μ={mean:.2f}, σ={std:.2f}")
-
-            # Phrase d’interprétation (et conversion années pour DAYS_*)
-            st.write(interpret_sentence(f, val, perc, z, mean, std))
-
-            # Graph histo
-            if HAS_PLOTLY and edges and counts:
-                centers = (np.array(edges[:-1]) + np.array(edges[1:])) / 2.0
-                fig = go.Figure()
-                fig.add_trace(go.Bar(x=centers, y=counts, name="Population", opacity=0.8))
-                fig.add_vline(x=val, line_color="#ef4444", line_width=3)
-                x_title = nice_feature_name(f)
-                if f in ("DAYS_BIRTH", "DAYS_EMPLOYED", "DAYS_REGISTRATION"):
-                    x_title += " (jours négatifs • passé) — note : conversion affichée en années dans le texte"
-                fig.update_layout(
-                    xaxis_title=x_title,
-                    yaxis_title="Effectif",
-                    showlegend=False,
-                    height=280,
-                    margin=dict(l=40, r=20, t=20, b=40),
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.write("Histogramme indisponible (Plotly ou stats manquantes).")
-
-# =========================
-# 11) Pied de page
-# =========================
+# 10) Comparaison population (REF_STATS)
 st.markdown("---")
-st.caption("💡 Conseil : si tu déploies l’API en ligne, définis API_URL dans `.streamlit/secrets.toml` ou comme variable d’environnement.")
+st.markdown("### 📊 Comparaison avec la population (référence = jeu d’entraînement)")
+if REF_STATS is None:
+    st.info("Stats de population indisponibles (`artifacts/ref_stats.json`). Génère-les depuis ton notebook et place le fichier dans `artifacts/`.")
+else:
+    # Helper pour affichage percentile + interprétation
+    def show_population_position(feature: str, label: str, value: Optional[float], fmt: str = ".0f", unit: str = ""):
+        stats = REF_STATS.get(feature)
+        if not stats or value is None:
+            st.write(f"**{label}** : information manquante.")
+            return
+        mu = stats.get("mean")
+        sigma = stats.get("std")
+        q = stats.get("quantiles", {})  # dict "pXX" -> val
+        # position percentile approx par histogramme (si dispo) — sinon via quantiles
+        # Ici on tente une interpolation simple avec quantiles si p5/p50/p95
+        p_est = None
+        # on fabrique une phrase simple & utile
+        if mu is not None and sigma not in (None, 0):
+            z = (value - mu) / sigma
+            side = "au-dessus" if value > mu else "au-dessous"
+            st.write(f"**{label}** : {value:{fmt}}{unit} — {side} de la moyenne (μ={mu:{fmt}}{unit}, σ={sigma:{fmt}}).")
+            # petit graphique repère
+            fig = go.Figure()
+            fig.add_trace(go.Indicator(
+                mode="gauge+number",
+                value=value,
+                title={"text": label},
+                gauge={"axis": {"range": [max(0, mu - 3*sigma), mu + 3*sigma]},
+                       "bar": {"thickness": 0.5}},
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(
+                "Lecture : plus la valeur s’éloigne de la moyenne, plus le profil diffère du client moyen."
+            )
+        else:
+            st.write(f"**{label}** : {value:{fmt}}{unit} (μ/σ indisponibles).")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        show_population_position("AMT_CREDIT", "Montant du crédit", payload.get("AMT_CREDIT"), fmt=".0f", unit=" €")
+    with c2:
+        # Convertir âge (jours) → années pour LECTURE (on a envoyé jours à l’API)
+        age_disp = age_years
+        show_population_position("AGE_YEARS", "Âge (années)", age_disp, fmt=".1f", unit=" ans")
+    with c3:
+        inc = payload.get("AMT_INCOME_TOTAL")
+        show_population_position("AMT_INCOME_TOTAL", "Revenu annuel", inc, fmt=".0f", unit=" €")
+
+# 11) Cohorte similaire (si SEG_STATS dispo)
+st.markdown("---")
+st.markdown("### 👥 Cohorte similaire (âge & type de contrat)")
+if SEG_STATS is None:
+    st.info("Stats cohortes indisponibles (`artifacts/seg_stats.json`).")
+else:
+    # Trouver une tranche d’âge simple
+    age_bin = None
+    if age_years is not None:
+        # Exemple de tranches : [0-30], (30-40], (40-50], (50+]
+        bins = [0, 30, 40, 50, 120]
+        labels = ["0-30", "30-40", "40-50", "50+"]
+        for lo, hi, lab in zip(bins[:-1], bins[1:], labels):
+            if lo <= age_years <= hi:
+                age_bin = lab
+                break
+    cohort_key = None
+    if age_bin and contract:
+        cohort_key = f"{age_bin}|{contract}"
+    elif age_bin:
+        cohort_key = f"{age_bin}|*"
+
+    if not cohort_key or cohort_key not in SEG_STATS:
+        st.warning("Aucune statistique disponible pour cette cohorte (vérifie les clés du JSON).")
+    else:
+        seg = SEG_STATS[cohort_key]
+        st.write(f"**Cohorte**: `{cohort_key}` — taille ~ {seg.get('count', '?')}")
+        # Exemple d’agrégats
+        st.write("Aperçu indicateurs (moyennes) :")
+        st.json(seg.get("means", {}))
+
+# 12) Prédictions en lot (CSV) → sidebar
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("### 📦 Prédictions en lot (CSV)")
+    st.caption("Envoie un CSV avec **les mêmes colonnes** que l’API attend. Retour: probas par ligne.")
+    up = st.file_uploader("Fichier CSV", type=["csv"])
+    if up is not None:
+        try:
+            df = pd.read_csv(up)
+            # Remplir les colonnes manquantes si exp_cols dispo
+            if exp_cols:
+                for col in exp_cols:
+                    if col not in df.columns:
+                        df[col] = None
+                df = df[exp_cols]
+            data = {"rows": df.to_dict(orient="records")}
+            ok, js, err = http_post_json(f"{API_URL}/predict_proba_batch", data, timeout=30)
+            if not ok:
+                st.error(f"Erreur /predict_proba_batch : {err}\n\nRéponse: {js}")
+            else:
+                out = js.get("predictions", [])
+                st.success(f"{len(out)} prédictions reçues")
+                st.dataframe(pd.DataFrame({"proba_default": out}))
+        except Exception as e:
+            st.error(f"Lecture CSV impossible: {e}")
+
+# 13) Importance globale (si fournie)
+st.markdown("---")
+st.markdown("### 🧠 Variables les plus influentes (globales)")
+if GLOBAL_IMP is None or GLOBAL_IMP.empty:
+    st.caption("Aucune importance globale fournie (place `artifacts/global_importance.csv`).")
+else:
+    topk = st.slider("Top variables à afficher", 5, 30, 15, 1)
+    sub = GLOBAL_IMP.head(topk)
+    fig = go.Figure(go.Bar(x=sub["abs_importance"], y=sub["raw_feature"], orientation="h"))
+    fig.update_layout(height=400 + 18 * len(sub), margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Ces importances proviennent du notebook d’entraînement (moyenne absolue de l’impact).")
