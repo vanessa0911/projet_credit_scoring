@@ -1,194 +1,210 @@
 # api.py
-from typing import Dict, Any, List, Tuple
-import os
-import json
+from __future__ import annotations
 
+from typing import Dict, Any, List, Optional, Tuple
+import json
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from joblib import load
+from scipy import sparse
 
+# =============================================================================
+# 0) Chemins ABSOLUS (robustes)
+# =============================================================================
+BASE_DIR = Path(__file__).parent.resolve()
+ARTIFACT_DIR = BASE_DIR / "artifacts"
 
-# =========================
-# Chemins des artefacts
-# =========================
-ARTIFACT_DIR = "artifacts"
-BASELINE_PATH = os.path.join(ARTIFACT_DIR, "model_baseline_logreg.joblib")
-CALIB_ISO_PATH = os.path.join(ARTIFACT_DIR, "model_calibrated_isotonic.joblib")
-CALIB_SIG_PATH = os.path.join(ARTIFACT_DIR, "model_calibrated_sigmoid.joblib")
-METADATA_PATH = os.path.join(ARTIFACT_DIR, "metadata.json")
+BASELINE_PATH = ARTIFACT_DIR / "model_baseline_logreg.joblib"
+CALIB_ISO_PATH = ARTIFACT_DIR / "model_calibrated_isotonic.joblib"
+CALIB_SIG_PATH = ARTIFACT_DIR / "model_calibrated_sigmoid.joblib"
+METADATA_PATH = ARTIFACT_DIR / "metadata.json"
+REF_STATS_PATH = ARTIFACT_DIR / "ref_stats.json"
 
-
-# =========================
-# Helpers : déballer la Pipeline & récupérer le preprocess
-# =========================
-def unwrap_pipeline(est: Any):
-    """
-    Retourne la Pipeline interne (avec .named_steps) quel que soit l'enrobage.
-    - Si 'est' est déjà une Pipeline -> retourne est
-    - Si 'est' est un CalibratedClassifierCV -> retourne est.estimator (ou base_estimator) s'il s'agit d'une Pipeline
-    """
-    if hasattr(est, "named_steps"):
-        return est
-
-    inner = None
-    if hasattr(est, "estimator"):
-        inner = getattr(est, "estimator")
-    elif hasattr(est, "base_estimator"):
-        inner = getattr(est, "base_estimator")
-
-    if inner is not None and hasattr(inner, "named_steps"):
-        return inner
-
-    raise AttributeError(
-        "Impossible de retrouver la Pipeline interne (named_steps). "
-        "Assure-toi que l'artefact est une sklearn.Pipeline ou un CalibratedClassifierCV(Pipeline)."
-    )
-
-
-def get_preprocess_step(est: Any):
-    """
-    Renvoie le step 'preprocess' (ColumnTransformer) depuis une Pipeline.
-    """
-    pipe_inner = unwrap_pipeline(est)
-    if "preprocess" not in pipe_inner.named_steps:
-        raise KeyError(
-            "Le step 'preprocess' est introuvable dans la Pipeline. "
-            "Vérifie que ta Pipeline est bien Pipeline([('preprocess', ...), ('model', ...)])"
-        )
-    return pipe_inner.named_steps["preprocess"]
-
-
-def list_cols_from_column_transformer(ct) -> List[str]:
-    """
-    Retourne la liste des colonnes déclarées pour les blocs 'num' et 'cat'.
-    Gère les deux cas :
-      - avant fit  : ct.transformers
-      - après fit  : ct.transformers_
-    """
-    items = getattr(ct, "transformers_", None)
-    if items is None:
-        items = getattr(ct, "transformers", [])
-
-    cols: List[str] = []
-    for t in items:
-        # t est typiquement (name, transformer, cols_sel, [optional_weight])
-        name = t[0]
-        if name not in ("num", "cat"):
-            continue
-        cols_sel = t[2] if len(t) >= 3 else []
-        if isinstance(cols_sel, (list, tuple, np.ndarray, pd.Index)):
-            cols.extend(list(cols_sel))
-        elif cols_sel is not None:
-            cols.append(cols_sel)
-    return cols
-
-
-def get_output_feature_names_from_preprocess(preprocess) -> List[str]:
-    """
-    Reconstitue les noms de features après préprocessing :
-      - numériques : noms identiques (après StandardScaler)
-      - catégorielles : noms One-Hot via l'encoder
-    """
-    # Récupère les colonnes brutes num / cat
-    items = getattr(preprocess, "transformers_", None) or getattr(preprocess, "transformers", [])
-    num_cols, cat_cols = [], []
-    for name, transformer, cols_sel, *rest in items:
-        if name == "num":
-            num_cols = list(cols_sel)
-        elif name == "cat":
-            cat_cols = list(cols_sel)
-
-    # Encoder catégoriel (fit dans l'artefact baseline)
-    try:
-        ohe = preprocess.named_transformers_["cat"].named_steps["encoder"]
-    except Exception as e:
-        raise RuntimeError(f"Encoder catégoriel indisponible dans le préprocesseur: {e}")
-
-    # Noms OHE (compat >=1.0 et anciens)
-    try:
-        cat_feature_names = ohe.get_feature_names_out(cat_cols)
-    except AttributeError:
-        cat_feature_names = ohe.get_feature_names(cat_cols)
-
-    full_names = list(num_cols) + list(cat_feature_names)
-    return [str(n) for n in full_names]
-
-
-# =========================
-# Chargement du modèle de prédiction (calibré ou non) + seuil
-# =========================
+# =============================================================================
+# 1) Chargement modèle + seuil
+# =============================================================================
 def load_model_and_threshold() -> Tuple[Any, float, str]:
+    """
+    Charge le modèle choisi dans artifacts/ + lit le seuil de décision
+    depuis metadata.json si présent.
+    Retourne: (model, threshold, chosen_name)
+    """
     chosen = "baseline"
     threshold = 0.5
 
-    if os.path.exists(METADATA_PATH):
-        with open(METADATA_PATH, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        chosen = meta.get("chosen_model", "baseline")
-        threshold = float(meta.get("decision_threshold", {}).get("t_selected", 0.5))
+    if METADATA_PATH.exists():
+        try:
+            meta = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+            chosen = meta.get("chosen_model", "baseline")
+            # decision_threshold peut être { "t_selected": 0.17, ... }
+            th = meta.get("decision_threshold", {})
+            if isinstance(th, dict):
+                threshold = float(th.get("t_selected", threshold))
+            elif isinstance(th, (int, float)):
+                threshold = float(th)
+        except Exception:
+            pass
 
-    if chosen == "isotonic" and os.path.exists(CALIB_ISO_PATH):
+    # Sélection du bon artefact model
+    if chosen == "isotonic" and CALIB_ISO_PATH.exists():
         model_path = CALIB_ISO_PATH
-    elif chosen == "sigmoid" and os.path.exists(CALIB_SIG_PATH):
+    elif chosen == "sigmoid" and CALIB_SIG_PATH.exists():
         model_path = CALIB_SIG_PATH
     else:
-        model_path = BASELINE_PATH
+        # fallback
         chosen = "baseline"
+        model_path = BASELINE_PATH
 
-    if not os.path.exists(model_path):
+    if not model_path.exists():
         raise FileNotFoundError(
-            f"Impossible de trouver le modèle à {model_path}. "
-            f"Vérifie que le dossier '{ARTIFACT_DIR}' contient bien les fichiers .joblib."
+            f"Artefact modèle introuvable: {model_path}\n"
+            "Assure-toi d’avoir entraîné et sauvegardé les artefacts."
         )
 
     model = load(model_path)
-    return model, threshold, chosen
+    return model, float(threshold), str(chosen)
 
 
-# =========================
-# Chargement du modèle d'explication (toujours la baseline logistique fit)
-# =========================
-def load_explainer_pipeline() -> Any:
-    if not os.path.exists(BASELINE_PATH):
-        raise FileNotFoundError(
-            f"Impossible de trouver la pipeline baseline à {BASELINE_PATH}. "
-            "Elle est nécessaire pour calculer les contributions locales."
-        )
-    base = load(BASELINE_PATH)  # pipeline fit (préprocess + LogisticRegression)
-    # vérifications rapides
-    pipe_inner = unwrap_pipeline(base)
-    assert "preprocess" in pipe_inner.named_steps and "model" in pipe_inner.named_steps, \
-        "L'artefact baseline ne ressemble pas à Pipeline([('preprocess'), ('model')])."
-    return base
+MODEL, DECISION_THRESHOLD, CHOSEN_NAME = load_model_and_threshold()
+
+# =============================================================================
+# 2) Utilitaires pour accéder à la Pipeline même si le modèle est calibré
+# =============================================================================
+def get_pipeline_from_model(model: Any):
+    """
+    Retourne la Pipeline (préprocess + model) à expliquer / interroger
+    même si le modèle est enveloppé dans un CalibratedClassifierCV.
+    """
+    # Cas simple: c'est déjà une Pipeline
+    if hasattr(model, "named_steps"):
+        return model
+
+    # CalibratedClassifierCV (sklearn) expose .estimator (base estimator)
+    for attr in ("estimator", "base_estimator"):
+        inner = getattr(model, attr, None)
+        if inner is not None and hasattr(inner, "named_steps"):
+            return inner
+
+    # Impossible de récupérer une Pipeline
+    return None
 
 
-# ===== charge les deux =====
-model_predict, DECISION_THRESHOLD, CHOSEN_NAME = load_model_and_threshold()
-model_explain = load_explainer_pipeline()  # pipeline logistique FIT pour les contributions
+def get_preprocess_and_clf(pipe) -> Tuple[Any, Any]:
+    """
+    Retourne (preprocess, classifier) depuis une Pipeline scikit-learn
+    en supposant des steps nommés "preprocess" et "model".
+    """
+    preprocess = None
+    clf = None
+    if pipe is not None and hasattr(pipe, "named_steps"):
+        preprocess = pipe.named_steps.get("preprocess")
+        clf = pipe.named_steps.get("model")
+    return preprocess, clf
 
 
-# =========================
-# Colonnes attendues (on s'appuie sur la baseline FIT)
-# =========================
-def expected_input_columns() -> List[str]:
-    preprocess = get_preprocess_step(model_explain)
-    cols = list_cols_from_column_transformer(preprocess)
-    # Par sécurité, ne pas exiger l'ID si tu l'as exclu à l'entraînement
+def get_expected_input_columns_from_preprocess(preprocess) -> List[str]:
+    """
+    Lit la configuration du ColumnTransformer (champ .transformers) pour
+    récupérer les colonnes brutes attendues (num + cat).
+    N'utilise PAS .transformers_ (pas besoin d’être 'fitted' pour lire la config).
+    """
+    cols: List[str] = []
+    if preprocess is None:
+        return cols
+
+    transformers = getattr(preprocess, "transformers", None)
+    if not transformers:
+        return cols
+
+    for name, _trans, cols_sel in transformers:
+        if name in ("num", "cat"):
+            # cols_sel est typiquement une liste de noms de colonnes
+            if isinstance(cols_sel, (list, tuple)):
+                cols.extend(list(cols_sel))
+    # Par sécurité on enlève l'ID si jamais il s'y trouve
     cols = [c for c in cols if c != "SK_ID_CURR"]
     return cols
 
 
+def get_full_feature_names(preprocess, cat_cols: List[str], num_cols: List[str]) -> Optional[np.ndarray]:
+    """
+    Construit la liste des noms de features APRÈS transformation:
+      [num_cols] + OHE(cat_cols)
+    Requiert un preprocess FIT (pour que .named_transformers_ et l'encodage existent).
+    """
+    if preprocess is None:
+        return None
+
+    try:
+        # Récupère l'OHE de la branche 'cat'
+        cat_pipe = preprocess.named_transformers_.get("cat")
+        if cat_pipe is None:
+            return None
+        # Le OneHotEncoder peut être dans un Pipeline avec étape 'encoder'
+        ohe = getattr(cat_pipe, "named_steps", {}).get("encoder", cat_pipe)
+        cat_names = ohe.get_feature_names_out(cat_cols)
+        full = np.concatenate([np.array(num_cols), np.array(cat_names)])
+        return full
+    except Exception:
+        return None
+
+
+def to_dense(X):
+    """Convertit une matrice potentiellement sparse en dense numpy array."""
+    if sparse.issparse(X):
+        return X.toarray()
+    return np.asarray(X)
+
+
+# =============================================================================
+# 3) Colonnes attendues (brutes avant encodage)
+# =============================================================================
+def expected_input_columns() -> List[str]:
+    """
+    Déduit les colonnes brutes attendues par le préprocesseur.
+    Fallback: si indisponible, essaie metadata.json ('expected_input_columns').
+    """
+    pipe = get_pipeline_from_model(MODEL)
+    preprocess, _ = get_preprocess_and_clf(pipe)
+    cols = get_expected_input_columns_from_preprocess(preprocess)
+    if cols:
+        return cols
+
+    # Fallback: metadata.json
+    if METADATA_PATH.exists():
+        try:
+            meta = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+            cols_meta = meta.get("expected_input_columns")
+            if isinstance(cols_meta, list) and cols_meta:
+                return [c for c in cols_meta if c != "SK_ID_CURR"]
+        except Exception:
+            pass
+    return []
+
+
 EXPECTED_COLS = expected_input_columns()
 
+# =============================================================================
+# 4) Chargement des stats de référence (train) pour /ref_stats
+# =============================================================================
+def load_ref_stats() -> dict:
+    """Charge artifacts/ref_stats.json (généré par make_ref_stats.py) si présent."""
+    try:
+        if REF_STATS_PATH.exists():
+            return json.loads(REF_STATS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
 
-# =========================
-# Schémas I/O (Pydantic)
-# =========================
+# =============================================================================
+# 5) Pydantic models (IO)
+# =============================================================================
 class PredictRequest(BaseModel):
-    features: Dict[str, Any]  # {nom_colonne: valeur}
-
+    features: Dict[str, Any]
 
 class PredictResponse(BaseModel):
     probability_default: float
@@ -197,57 +213,72 @@ class PredictResponse(BaseModel):
     missing_features: List[str]
     used_model: str
 
-
-class Contribution(BaseModel):
-    feature: str
-    contribution: float  # contribution en log-odds
-
-
 class ExplainResponse(BaseModel):
     probability_default: float
     decision: str
     threshold: float
     used_model: str
-    bias: float
-    top_contributions: List[Contribution]
+    bias: Optional[float] = None
+    top_contributions: Optional[List[Dict[str, Any]]] = None
+    note: Optional[str] = None
 
-
-# =========================
-# FastAPI app
-# =========================
+# =============================================================================
+# 6) FastAPI app
+# =============================================================================
 app = FastAPI(title="Credit Scoring API", version="0.2.0")
 
+# ---- petits helpers
+def align_features(payload: Dict[str, Any]) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Aligne le dict reçu sur les colonnes attendues :
+      - colonnes manquantes -> NaN
+      - colonnes en trop -> ignorées
+    """
+    if not EXPECTED_COLS:
+        raise HTTPException(
+            status_code=500,
+            detail="Colonnes attendues indisponibles. Vérifie l'artefact du préprocesseur ou metadata.json."
+        )
+    missing = [c for c in EXPECTED_COLS if c not in payload]
+    row = {c: payload.get(c, np.nan) for c in EXPECTED_COLS}
+    df = pd.DataFrame([row], columns=EXPECTED_COLS)
+    return df, missing
 
-@app.get("/")
-def root():
-    return {"message": "Credit Scoring API is up. See /docs for interactive Swagger UI."}
+def decide_label(prob: float, thr: float) -> str:
+    return "refusé" if prob >= thr else "accordé"
 
 
+# =============================================================================
+# 7) Endpoints
+# =============================================================================
 @app.get("/health")
 def health():
+    ref_ok = REF_STATS_PATH.exists()
     return {
         "status": "ok",
         "used_model": CHOSEN_NAME,
         "threshold": DECISION_THRESHOLD,
         "expected_n_features": len(EXPECTED_COLS),
+        "ref_stats_available": ref_ok,
     }
-
 
 @app.get("/expected_features")
 def expected_features():
     return {"expected_features": EXPECTED_COLS}
 
-
-def align_features(payload: Dict[str, Any]) -> Tuple[pd.DataFrame, List[str]]:
+@app.get("/ref_stats")
+def ref_stats():
     """
-    Aligne le dict reçu sur les colonnes attendues :
-      - colonnes manquantes -> NaN
-      - colonnes en trop   -> ignorées
+    Statistiques de référence calculées à partir du train (application_train.csv),
+    générées via make_ref_stats.py et sauvegardées dans artifacts/ref_stats.json.
     """
-    missing = [c for c in EXPECTED_COLS if c not in payload]
-    row = {c: payload.get(c, np.nan) for c in EXPECTED_COLS}
-    df = pd.DataFrame([row], columns=EXPECTED_COLS)
-    return df, missing
+    stats = load_ref_stats()
+    if not stats:
+        return {
+            "available": False,
+            "message": "ref_stats.json absent. Lance make_ref_stats.py pour le générer."
+        }
+    return {"available": True, "stats": stats}
 
 
 @app.post("/predict", response_model=PredictResponse)
@@ -258,92 +289,129 @@ def predict(req: PredictRequest):
     X_input, missing = align_features(req.features)
 
     try:
-        proba = float(model_predict.predict_proba(X_input)[:, 1][0])
+        proba = float(MODEL.predict_proba(X_input)[:, 1][0])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur pendant la prédiction: {e}")
 
-    decision = "refusé" if proba >= DECISION_THRESHOLD else "accordé"
+    decision = decide_label(proba, DECISION_THRESHOLD)
 
     return PredictResponse(
         probability_default=proba,
         decision=decision,
         threshold=float(DECISION_THRESHOLD),
         missing_features=missing,
-        used_model=CHOSEN_NAME,
+        used_model=CHOSEN_NAME
     )
 
 
-# =========================
-# EXPLICATION LOCALE (sans SHAP) via contributions logistiques
-# =========================
-def compute_logreg_contributions(est: Any, X_df: pd.DataFrame) -> Tuple[float, List[Tuple[str, float]]]:
-    """
-    Calcule les contributions 'locales' pour UNE ligne en utilisant la pipeline baseline FIT :
-      - transforme X via preprocess
-      - contributions = coef * valeur_transformée (par feature)
-      - renvoie (intercept, liste triée par |contribution|)
-    """
-    pipe_inner = unwrap_pipeline(est)
-    preprocess = pipe_inner.named_steps["preprocess"]
-    model_step = pipe_inner.named_steps["model"]  # LogisticRegression
-
-    # Transforme la ligne
-    X_trans = preprocess.transform(X_df)
-    if hasattr(X_trans, "toarray"):
-        X_trans = X_trans.toarray()
-
-    # Coefficients & intercept (classe 1)
-    coefs = model_step.coef_.ravel()
-    intercept = float(model_step.intercept_[0])
-
-    # Noms de features transformées
-    feat_names = get_output_feature_names_from_preprocess(preprocess)
-
-    # Contributions (même ordre que X_trans)
-    row = X_trans[0]
-    contrib_pairs = list(zip(feat_names, row * coefs))
-    contrib_pairs_sorted = sorted(contrib_pairs, key=lambda t: abs(t[1]), reverse=True)
-    return intercept, contrib_pairs_sorted
-
-
 @app.post("/explain", response_model=ExplainResponse)
-def explain(req: PredictRequest, top_k: int = 8):
+def explain(
+    req: PredictRequest,
+    top_k: int = Query(8, ge=1, le=50, description="Nombre de contributions à retourner"),
+):
     """
-    Explique la prédiction pour une observation :
-      - probabilité (du modèle choisi : baseline ou calibré)
-      - décision selon threshold
-      - top_k contributions en log-odds issues de la baseline logistique FIT
+    Explication locale (TOP-K) en termes de contributions en log-odds.
+    - Fonctionne lorsque le modèle interne est une Régression Logistique dans une Pipeline
+      (même si le modèle exposé est calibré Isotonic/Sigmoid).
+    - On explique la partie linéaire (pré-calibrage).
     """
     if not isinstance(req.features, dict) or len(req.features) == 0:
         raise HTTPException(status_code=400, detail="Le champ 'features' doit être un dictionnaire non vide.")
 
-    # Aligner les features
-    X_input, _ = align_features(req.features)
-
-    # Proba + décision (calibré si choisi)
+    # 1) Toujours renvoyer la prédiction API (calibrée ou non)
     try:
-        proba = float(model_predict.predict_proba(X_input)[:, 1][0])
+        X_input, _missing = align_features(req.features)
+        proba = float(MODEL.predict_proba(X_input)[:, 1][0])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur pendant la prédiction: {e}")
-    decision = "refusé" if proba >= DECISION_THRESHOLD else "accordé"
 
-    # Contributions locales via baseline logistique FIT
-    try:
-        bias, pairs_sorted = compute_logreg_contributions(model_explain, X_input)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Explication indisponible (artefact baseline incompatible) : {e}"
+    decision = decide_label(proba, DECISION_THRESHOLD)
+
+    # 2) Tenter une explication log-odds via la Pipeline interne
+    pipe = get_pipeline_from_model(MODEL)
+    preprocess, clf = get_preprocess_and_clf(pipe)
+
+    # pipeline valide + logistic regression ?
+    ok_lr = hasattr(clf, "coef_") and hasattr(clf, "intercept_")
+    if not (pipe and preprocess and ok_lr and EXPECTED_COLS):
+        # Explication non dispo: renvoyer une note explicite
+        return ExplainResponse(
+            probability_default=proba,
+            decision=decision,
+            threshold=float(DECISION_THRESHOLD),
+            used_model=CHOSEN_NAME,
+            top_contributions=None,
+            bias=None,
+            note="Explication indisponible (modèle non linéaire ou artefact incompatible)."
         )
 
-    top_k = max(1, int(top_k))
-    top = [{"feature": f, "contribution": float(v)} for f, v in pairs_sorted[:top_k]]
+    # Colonnes brutes num/cat d'après la config
+    num_cols: List[str] = []
+    cat_cols: List[str] = []
+    transformers = getattr(preprocess, "transformers", []) or []
+    for name, _t, cols_sel in transformers:
+        if name == "num":
+            num_cols = list(cols_sel)
+        elif name == "cat":
+            cat_cols = list(cols_sel)
+
+    # Features après transformation (nécessite preprocess FIT)
+    full_names = get_full_feature_names(preprocess, cat_cols, num_cols)
+    if full_names is None:
+        return ExplainResponse(
+            probability_default=proba,
+            decision=decision,
+            threshold=float(DECISION_THRESHOLD),
+            used_model=CHOSEN_NAME,
+            top_contributions=None,
+            bias=None,
+            note="Explication indisponible (noms de features transformées inaccessibles)."
+        )
+
+    # Transformer l'input avec le preprocess
+    try:
+        X_proc = preprocess.transform(X_input)  # sparse/dense
+        X_proc = to_dense(X_proc).reshape(1, -1)
+    except Exception as e:
+        return ExplainResponse(
+            probability_default=proba,
+            decision=decision,
+            threshold=float(DECISION_THRESHOLD),
+            used_model=CHOSEN_NAME,
+            top_contributions=None,
+            bias=None,
+            note=f"Explication indisponible (erreur transform): {e}"
+        )
+
+    # Contributions en log-odds = coef * x ; bias = intercept
+    coef = np.asarray(clf.coef_).reshape(-1)      # shape (n_features,)
+    bias = float(np.asarray(clf.intercept_).reshape(-1)[0])
+
+    if X_proc.shape[1] != coef.shape[0]:
+        return ExplainResponse(
+            probability_default=proba,
+            decision=decision,
+            threshold=float(DECISION_THRESHOLD),
+            used_model=CHOSEN_NAME,
+            top_contributions=None,
+            bias=None,
+            note="Explication indisponible (mismatch dimensions features/coefs)."
+        )
+
+    contrib = X_proc.flatten() * coef  # (n_features,)
+    # top-k par valeur absolue
+    order = np.argsort(-np.abs(contrib))[:top_k]
+    top = [
+        {"feature": str(full_names[i]), "contribution": float(contrib[i])}
+        for i in order
+    ]
 
     return ExplainResponse(
         probability_default=proba,
         decision=decision,
         threshold=float(DECISION_THRESHOLD),
         used_model=CHOSEN_NAME,
-        bias=float(bias),
-        top_contributions=top
+        bias=bias,
+        top_contributions=top,
+        note="Contributions exprimées en log-odds sur la couche linéaire (avant calibration éventuelle)."
     )
