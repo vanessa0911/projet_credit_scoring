@@ -1,19 +1,66 @@
-# Python
+# =========================
+# Projet Credit Scoring (.gitignore)
+# =========================
+
+# --- Python / build ---
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
-*.log
+*.so
+*.dll
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+site/
 
-# Environnements virtuels
+# --- Environnements virtuels ---
 .venv/
 venv/
+env/
+ENV/
+.python-version
 
-# OS / éditeur
+# --- Logs & caches ---
+*.log
+.cache/
+.mypy_cache/
+.pytype/
+.dmypy.json
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Streamlit ---
+.streamlit/secrets.toml
+
+# --- OS / éditeurs ---
 .DS_Store
 Thumbs.db
+desktop.ini
 .vscode/
 .idea/
+*.code-workspace
 
-# Secrets (si tu en as un jour)
-.env
+# --- Données brutes (gros fichiers locaux) ---
+data/
+!data/.gitkeep
+!data/README.md
+
+# --- Artifacts (on conserve modèles & métriques ; on ignore juste des sous-dossiers temporaires) ---
+artifacts/tmp/
+artifacts/cache/
+
+# --- Divers ---
+*.tmp
+*.bak
