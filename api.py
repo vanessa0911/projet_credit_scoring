@@ -5,6 +5,7 @@
 #   GET  /                    -> statut + méta
 #   GET  /health              -> statut "ok"
 #   GET  /expected_columns    -> liste des colonnes attendues (avant encodage)
+#   GET  /value_domains       -> domaines de valeurs pour les variables qualitatives (si détectables)
 #   POST /predict             -> {"data": { ...features... }}         -> proba + décision
 #   POST /predict_proba_batch -> {"records": [ {...}, {...} ]}        -> probas + décisions
 #
@@ -33,6 +34,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from joblib import load
 
+# ---- pour /value_domains (option B)
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
 
 # ======================================================================================
 # Constantes & chemins
@@ -47,7 +51,6 @@ MODEL_CANDIDATES = {
     "sigmoid": "model_calibrated_sigmoid.joblib",
     "baseline": "model_baseline_logreg.joblib",
 }
-
 
 # ======================================================================================
 # Helpers
@@ -67,13 +70,11 @@ def _safe_json_read(path: str) -> Dict[str, Any]:
         txt2 = re.sub(r',\s*([}\]])', r'\1', txt)
         return json.loads(txt2)
 
-
 def _first_existing(paths: List[str]) -> Optional[str]:
     for p in paths:
         if os.path.exists(p):
             return p
     return None
-
 
 def _extract_expected_columns(model: Any) -> List[str]:
     """
@@ -109,7 +110,6 @@ def _extract_expected_columns(model: Any) -> List[str]:
     # 4) Rien trouvé
     return []
 
-
 def _predict_proba_safely(model: Any, X: pd.DataFrame) -> np.ndarray:
     """Renvoie proba classe positive (shape: (n_samples,))."""
     if hasattr(model, "predict_proba"):
@@ -126,7 +126,6 @@ def _predict_proba_safely(model: Any, X: pd.DataFrame) -> np.ndarray:
         return 1.0 / (1.0 + np.exp(-df))  # sigmoïde
     raise RuntimeError("Le modèle ne supporte pas predict_proba/decision_function.")
 
-
 def _build_dataframe_one(data: Dict[str, Any], expected_cols: List[str]) -> pd.DataFrame:
     """
     Construit un DataFrame 1 ligne avec exactement les colonnes attendues.
@@ -140,7 +139,6 @@ def _build_dataframe_one(data: Dict[str, Any], expected_cols: List[str]) -> pd.D
     cols = sorted(list(data.keys()))
     return pd.DataFrame([{c: data.get(c, None) for c in cols}])
 
-
 def _decision_from_threshold(p: float, decision_threshold: Dict[str, Any] | float | None) -> Optional[int]:
     """Applique la décision (0/1) si un seuil est défini (1 = refuser, 0 = accepter)."""
     if decision_threshold is None:
@@ -152,6 +150,68 @@ def _decision_from_threshold(p: float, decision_threshold: Dict[str, Any] | floa
         return int(p >= float(decision_threshold))
     return None
 
+# ---- helpers option B: extraire les domaines de valeurs depuis le modèle
+def _find_column_transformer(model: Any) -> Optional[ColumnTransformer]:
+    # Cherche un ColumnTransformer dans la pipeline
+    for attr in ("named_steps", "steps"):
+        if hasattr(model, attr):
+            steps = getattr(model, attr)
+            if isinstance(steps, dict):
+                for step in steps.values():
+                    if isinstance(step, ColumnTransformer):
+                        return step
+            elif isinstance(steps, list):
+                for _, step in steps:
+                    if isinstance(step, ColumnTransformer):
+                        return step
+    # Wrappers éventuels
+    for wrap_attr in ("base_estimator", "estimator", "classifier"):
+        if hasattr(model, wrap_attr):
+            inner = getattr(model, wrap_attr)
+            ct = _find_column_transformer(inner)
+            if ct is not None:
+                return ct
+    return None
+
+def _value_domains_from_model(model: Any) -> Dict[str, list]:
+    """
+    Retourne {col_categorielle: [valeurs connues, ...]} si OneHotEncoder(categories_) est dispo.
+    - Gère OHE direct dans ColumnTransformer
+    - Gère OHE dans un sous-pipeline nommé 'cat'
+    """
+    domains: Dict[str, list] = {}
+    ct = _find_column_transformer(model)
+    if ct is None or not hasattr(ct, "transformers_"):
+        return domains
+
+    for name, transf, cols in ct.transformers_:
+        cols_list = list(cols) if cols is not None else []
+        # cas 1: OneHotEncoder direct
+        if isinstance(transf, OneHotEncoder) and hasattr(transf, "categories_"):
+            for c, colname in enumerate(cols_list):
+                try:
+                    cats = list(transf.categories_[c])
+                except Exception:
+                    cats = []
+                # cast en str (None -> "None" non souhaité -> on garde None)
+                cleaned = [None if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x) for x in cats]
+                domains[str(colname)] = cleaned
+            continue
+
+        # cas 2: pipeline imbriqué avec step OHE (souvent nommé 'cat')
+        if hasattr(transf, "named_steps"):
+            # cherche un OneHotEncoder dans les steps
+            for _, step in getattr(transf, "named_steps").items():
+                if isinstance(step, OneHotEncoder) and hasattr(step, "categories_"):
+                    for c, colname in enumerate(cols_list):
+                        try:
+                            cats = list(step.categories_[c])
+                        except Exception:
+                            cats = []
+                        cleaned = [None if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x) for x in cats]
+                        domains[str(colname)] = cleaned
+                    break
+    return domains
 
 # ======================================================================================
 # Chargement modèle + méta
@@ -216,12 +276,11 @@ def load_model_and_threshold() -> Tuple[Any, Dict[str, Any] | float | None, str,
 
     return model, decision_threshold, chosen_name, expected_cols
 
-
 # ======================================================================================
 # FastAPI app
 # ======================================================================================
 
-app = FastAPI(title="Credit Scoring API", version="1.0.0")
+app = FastAPI(title="Credit Scoring API", version="1.1.0")
 
 # CORS : autorise front local (Streamlit) sur localhost
 app.add_middleware(
@@ -243,7 +302,6 @@ try:
 except Exception as e:
     raise RuntimeError(f"[API startup] Erreur de chargement des artefacts : {e}")
 
-
 # ======================================================================================
 # Schémas Pydantic (entrées)
 # ======================================================================================
@@ -254,7 +312,6 @@ class PredictRequest(BaseModel):
 class BatchPredictRequest(BaseModel):
     records: List[Dict[str, Any]] = Field(..., description="Liste de clients (features brutes)")
 
-
 # ======================================================================================
 # Endpoints
 # ======================================================================================
@@ -263,12 +320,11 @@ class BatchPredictRequest(BaseModel):
 def health() -> Dict[str, Any]:
     return {"status": "ok"}
 
-
 @app.get("/")
 def root() -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "status": "ok",
-        "endpoints": ["/predict", "/predict_proba_batch", "/expected_columns", "/health", "/docs"],
+        "endpoints": ["/predict", "/predict_proba_batch", "/expected_columns", "/value_domains", "/health", "/docs"],
     }
     if CHOSEN_NAME:
         info["chosen_model"] = CHOSEN_NAME
@@ -281,11 +337,21 @@ def root() -> Dict[str, Any]:
         info["n_expected_columns"] = len(EXPECTED_COLS)
     return info
 
-
 @app.get("/expected_columns")
 def expected_columns() -> Dict[str, Any]:
     return {"expected_columns": EXPECTED_COLS, "count": len(EXPECTED_COLS)}
 
+@app.get("/value_domains")
+def value_domains() -> Dict[str, Any]:
+    """
+    Renvoie les valeurs possibles pour les variables qualitatives (si détectables).
+    Utilise OneHotEncoder.categories_ via le ColumnTransformer.
+    """
+    try:
+        domains = _value_domains_from_model(MODEL)
+        return {"domains": domains, "count": len(domains)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Impossible d'extraire les domaines: {e}")
 
 @app.post("/predict")
 def predict(req: PredictRequest) -> Dict[str, Any]:
@@ -301,7 +367,6 @@ def predict(req: PredictRequest) -> Dict[str, Any]:
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erreur de scoring : {e}")
-
 
 @app.post("/predict_proba_batch")
 def predict_proba_batch(req: BatchPredictRequest) -> Dict[str, Any]:
@@ -325,7 +390,6 @@ def predict_proba_batch(req: BatchPredictRequest) -> Dict[str, Any]:
         return {"results": results, "count": len(results), "model": CHOSEN_NAME, "threshold": DECISION_THRESHOLD}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erreur batch : {e}")
-
 
 # ======================================================================================
 # Lanceur local (optionnel)
