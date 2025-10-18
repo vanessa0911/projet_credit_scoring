@@ -12,7 +12,7 @@ pip install -r requirements.txt --no-cache-dir
 $env:API_URL = "http://127.0.0.1:8000"
 
 
-👉 Vérifier Python : python -V doit renvoyer 3.10.x.
+👉 Vérifier Python : python -V doit renvoyer 3.12.x.
 
 2) (Re)générer les artefacts du dashboard
 # Stats population + features dérivées (écrit artifacts/ref_stats.json)
