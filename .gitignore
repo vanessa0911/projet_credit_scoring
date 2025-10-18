@@ -22,7 +22,6 @@ site/
 venv/
 env/
 ENV/
-.python-version
 
 # --- Logs & caches ---
 *.log
@@ -37,6 +36,7 @@ ENV/
 .coverage.*
 coverage.xml
 htmlcov/
+.ruff_cache/
 
 # --- Jupyter ---
 .ipynb_checkpoints/
@@ -52,12 +52,18 @@ desktop.ini
 .idea/
 *.code-workspace
 
+# --- Config locales (optionnelles) ---
+.env
+.env.*
+
 # --- Données brutes (gros fichiers locaux) ---
 data/
 !data/.gitkeep
 !data/README.md
 
-# --- Artifacts (on conserve modèles & métriques ; on ignore juste des sous-dossiers temporaires) ---
+# --- Artifacts ---
+# On conserve les modèles/metrics par défaut.
+# On ignore seulement des sous-dossiers temporaires.
 artifacts/tmp/
 artifacts/cache/
 
