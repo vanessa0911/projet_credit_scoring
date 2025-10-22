@@ -10,19 +10,20 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # ------------------------------------------------------------------------------
-# App + CORS (nécessaire pour que le dashboard Streamlit atteigne l’API depuis le navigateur)
+# App + CORS (nécessaire pour l'appel depuis le dashboard Streamlit en Codespaces)
 # ------------------------------------------------------------------------------
 app = FastAPI(title="Credit Scoring API", version="1.0.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # en Codespaces on autorise tout : tu pourras restreindre ensuite
+    allow_origins=["*"],        # en Codespaces on ouvre largement; à restreindre si besoin
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ------------------------------------------------------------------------------
-# Utilitaires
+# Constantes & cache
 # ------------------------------------------------------------------------------
 DATA_CSV = Path("data/application_train.csv")
 ARTIFACTS_DIR = Path("artifacts")
@@ -31,18 +32,21 @@ REF_STATS_JSON = ARTIFACTS_DIR / "ref_stats.json"
 _expected_columns_cache: Optional[List[str]] = None
 
 
+# ------------------------------------------------------------------------------
+# Utilitaires
+# ------------------------------------------------------------------------------
 def _load_expected_columns() -> List[str]:
     """
-    Stratégie pour dev rapide :
-    1) si data/application_train.csv est présent, on lit l'en-tête
-    2) sinon si artifacts/ref_stats.json existe, on tente d'en déduire les colonnes
-    3) sinon on renvoie une liste vide (le front gérera)
+    Stratégie simple et robuste pour obtenir les colonnes d'entrée attendues :
+    1) Si data/application_train.csv existe, on lit l'en-tête (nrows=0)
+    2) Sinon, si artifacts/ref_stats.json existe, on tente de combiner les listes connues
+    3) Sinon, on renvoie [] (le front gère ce cas)
     """
     global _expected_columns_cache
     if _expected_columns_cache is not None:
         return _expected_columns_cache
 
-    # 1) CSV d’entraînement (le plus fiable)
+    # 1) depuis le CSV d'entraînement
     if DATA_CSV.exists():
         try:
             df_head = pd.read_csv(DATA_CSV, nrows=0)
@@ -51,37 +55,73 @@ def _load_expected_columns() -> List[str]:
         except Exception:
             pass
 
-    # 2) Artefacts (optionnel)
+    # 2) depuis les artefacts récap
     if REF_STATS_JSON.exists():
         try:
             with open(REF_STATS_JSON, "r", encoding="utf-8") as f:
                 ref = json.load(f)
-            # essaie des clés courantes si elles existent
-            cols = []
+            cols: List[str] = []
             for key in ("numerical_columns", "categorical_columns", "all_columns"):
-                if key in ref and isinstance(ref[key], list):
+                if isinstance(ref.get(key), list):
                     cols.extend(ref[key])
-            # dédoublonne tout en gardant l’ordre
+            # dédoublonne en conservant l'ordre
             _expected_columns_cache = list(dict.fromkeys(cols))
             return _expected_columns_cache
         except Exception:
             pass
 
-    # 3) par défaut : aucune (le front affichera un message)
+    # 3) défaut
     _expected_columns_cache = []
     return _expected_columns_cache
 
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
+def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         return float(x)
     except Exception:
         return default
 
 
+def _fallback_probability(features: Dict[str, Any]) -> float:
+    """
+    Fallback déterministe pour permettre au front de fonctionner sans modèle.
+    Heuristique simple basée sur ratio CREDIT/INCOME si disponible.
+    """
+    credit = None
+    income = None
+    for k, v in features.items():
+        lk = str(k).lower()
+        if credit is None and ("credit" in lk or "amt_credit" in lk):
+            credit = _safe_float(v)
+        if income is None and ("income" in lk or "amt_income_total" in lk):
+            income = _safe_float(v)
+
+    if credit is not None and income is not None and income > 0:
+        ratio = credit / income
+        # borne entre 0.01 et 0.99 pour éviter 0/1 stricts
+        prob = max(0.01, min(0.99, 0.2 + 0.6 * (ratio / (ratio + 1.0))))
+    else:
+        prob = 0.5
+    return float(prob)
+
+
 # ------------------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------------------
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "name": "Credit Scoring API",
+        "endpoints": [
+            "/",
+            "/health",
+            "/expected_columns",
+            "/predict",
+            "/predict_proba_batch",
+        ],
+    }
+
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -90,64 +130,55 @@ def health() -> Dict[str, str]:
 
 @app.get("/expected_columns")
 def expected_columns() -> List[str]:
-    cols = _load_expected_columns()
-    return cols
+    return _load_expected_columns()
 
 
 @app.post("/predict")
 def predict(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Endpoint minimaliste.
-    - Si aucun modèle n’est dispo, renvoie une proba heuristique stable (fallback),
-      pour ne pas casser le dashboard pendant l’intégration.
-    - Le front s’attend à recevoir: {"probability": float, "decision": int}
+    Corps attendu: {feature_name: value, ...}
+    Réponse: {"probability": float, "decision": int, "threshold": float, ...}
     """
-    cols = _load_expected_columns()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object with feature:value pairs.")
 
-    # Heuristique simple (fallback) : si variables clés présentes on calcule une proba naïve
-    # Tu pourras brancher ici ton vrai modèle quand il sera prêt.
-    # Exemple d’heuristique : ratio CREDIT/INCOME si colonnes existent
-    credit = None
-    income = None
-    # essaie quelques noms courants du dataset Home Credit
-    for k in payload.keys():
-        lk = k.lower()
-        if credit is None and ("credit" in lk or "amt_credit" in lk):
-            credit = _safe_float(payload[k], None)
-        if income is None and ("income" in lk or "amt_income_total" in lk):
-            income = _safe_float(payload[k], None)
-
-    if credit is not None and income is not None and income > 0:
-        ratio = credit / income
-        # borne la proba entre 0.01 et 0.99
-        prob = max(0.01, min(0.99, 0.2 + 0.6 * (ratio / (ratio + 1.0))))
-    else:
-        # fallback constant si pas de features utilisables
-        prob = 0.5
-
+    # TODO: brancher ici le vrai pipeline (preprocess + model.predict_proba)
+    prob = _fallback_probability(payload)
     threshold = 0.5
     decision = int(prob >= threshold)
 
     return {
-        "probability": float(prob),
+        "probability": prob,
         "decision": decision,
         "threshold": threshold,
-        "used_columns_count": len(cols),
+        "used_columns_count": len(_load_expected_columns()),
     }
 
 
 @app.post("/predict_proba_batch")
 def predict_proba_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Attendu par le mode batch du dashboard.
-    payload: {"instances": [ {feature: value, ...}, ... ]}
+    Corps attendu: {"instances": [ {feature: value, ...}, ... ]}
+    Réponse: {"probabilities": [float, ...], "count": int}
     """
     instances = payload.get("instances")
     if not isinstance(instances, list):
         raise HTTPException(status_code=400, detail="Body must contain a list under 'instances'.")
 
-    results: List[float] = []
+    probs: List[float] = []
     for row in instances:
-        results.append(predict(row)["probability"])  # réutilise la logique fallback
+        if not isinstance(row, dict):
+            raise HTTPException(status_code=400, detail="Each instance must be a JSON object.")
+        probs.append(_fallback_probability(row))
 
-    return {"probabilities": results, "count": len(results)}
+    return {"probabilities": probs, "count": len(probs)}
+
+
+# ------------------------------------------------------------------------------
+# Entrée locale (facultatif)
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    # Permet un run direct: python api.py
+    import uvicorn
+
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
