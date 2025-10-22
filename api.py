@@ -1,115 +1,153 @@
+# api.py
 from __future__ import annotations
 
-import io
-import json
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
-import joblib
-import numpy as np
+import json
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
 
-# =========================
-# Config répertoire artefacts
-# =========================
-ARTIFACTS_DIR = Path("artifacts")
-MODEL_PATH = ARTIFACTS_DIR / "model.joblib"           # adapte si ton modèle a un autre nom
-EXPECTED_COLS_PATH = ARTIFACTS_DIR / "expected_columns.json"  # optionnel
-REF_STATS_PATH = ARTIFACTS_DIR / "ref_stats.json"     # optionnel
-GLOBAL_IMP_PATH = ARTIFACTS_DIR / "global_importance.csv"  # optionnel
-
-# =========================
-# FastAPI init + CORS
-# =========================
-app = FastAPI(title="Credit Scoring API", version="1.0.0", docs_url="/docs", redoc_url="/redoc")
-
-# CORS permissif pour simplifier les tests (tu peux restreindre à l’URL du Streamlit)
+# ------------------------------------------------------------------------------
+# App + CORS (nécessaire pour que le dashboard Streamlit atteigne l’API depuis le navigateur)
+# ------------------------------------------------------------------------------
+app = FastAPI(title="Credit Scoring API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ex: ["https://*.githubpreview.dev"]
+    allow_origins=["*"],   # en Codespaces on autorise tout : tu pourras restreindre ensuite
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================
-# Modèles d’entrées/sorties
-# =========================
-class PredictItem(BaseModel):
-    # Utilise les noms de colonnes réels de ton modèle; ci-dessous un fallback minimal
-    AMT_INCOME_TOTAL: Optional[float] = Field(None, description="Revenu annuel")
-    AMT_CREDIT: Optional[float] = Field(None, description="Montant du crédit demandé")
-    DAYS_BIRTH: Optional[float] = Field(None, description="Âge en jours négatifs (HomeCredit) ou âge transformé")
+# ------------------------------------------------------------------------------
+# Utilitaires
+# ------------------------------------------------------------------------------
+DATA_CSV = Path("data/application_train.csv")
+ARTIFACTS_DIR = Path("artifacts")
+REF_STATS_JSON = ARTIFACTS_DIR / "ref_stats.json"
 
-class PredictRequest(BaseModel):
-    records: List[Dict[str, Any]]
-
-class PredictResponse(BaseModel):
-    proba: float
-    decision: int
-    threshold: float
-    missing_columns: List[str] = []
-
-class BatchPredictResponse(BaseModel):
-    results: List[PredictResponse]
-    expected_columns: List[str]
-
-# =========================
-# Chargement paresseux des artefacts
-# =========================
-_model = None
 _expected_columns_cache: Optional[List[str]] = None
 
-def load_model():
-    global _model
-    if _model is not None:
-        return _model
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Modèle introuvable à {MODEL_PATH}. "
-            "Entraîne/pose le fichier (joblib) ou ajuste MODEL_PATH dans api.py."
-        )
-    _model = joblib.load(MODEL_PATH)
-    return _model
 
-def get_expected_columns() -> List[str]:
+def _load_expected_columns() -> List[str]:
     """
-    Priorité :
-    1) artifacts/expected_columns.json  (liste de noms)
-    2) attribut .feature_names_in_ du modèle (scikit-learn >=1.0)
-    3) Fallback minimal (à adapter selon ton projet)
+    Stratégie pour dev rapide :
+    1) si data/application_train.csv est présent, on lit l'en-tête
+    2) sinon si artifacts/ref_stats.json existe, on tente d'en déduire les colonnes
+    3) sinon on renvoie une liste vide (le front gérera)
     """
     global _expected_columns_cache
     if _expected_columns_cache is not None:
         return _expected_columns_cache
 
-    # 1) Fichier JSON
-    if EXPECTED_COLS_PATH.exists():
+    # 1) CSV d’entraînement (le plus fiable)
+    if DATA_CSV.exists():
         try:
-            _expected_columns_cache = json.loads(EXPECTED_COLS_PATH.read_text(encoding="utf-8"))
-            if not isinstance(_expected_columns_cache, list):
-                raise ValueError("expected_columns.json doit contenir une liste de chaînes.")
-            _expected_columns_cache = [str(c) for c in _expected_columns_cache]
+            df_head = pd.read_csv(DATA_CSV, nrows=0)
+            _expected_columns_cache = list(df_head.columns)
             return _expected_columns_cache
-        except Exception as e:
-            # On log/continue vers les autres méthodes
-            print(f"[WARN] Lecture {EXPECTED_COLS_PATH} impossible: {e}")
+        except Exception:
+            pass
 
-    # 2) Depuis le modèle
-    try:
-        model = load_model()
-        if hasattr(model, "feature_names_in_"):
-            _expected_columns_cache = [str(c) for c in list(model.feature_names_in_)]
+    # 2) Artefacts (optionnel)
+    if REF_STATS_JSON.exists():
+        try:
+            with open(REF_STATS_JSON, "r", encoding="utf-8") as f:
+                ref = json.load(f)
+            # essaie des clés courantes si elles existent
+            cols = []
+            for key in ("numerical_columns", "categorical_columns", "all_columns"):
+                if key in ref and isinstance(ref[key], list):
+                    cols.extend(ref[key])
+            # dédoublonne tout en gardant l’ordre
+            _expected_columns_cache = list(dict.fromkeys(cols))
             return _expected_columns_cache
-    except Exception as e:
-        print(f"[WARN] Impossible d'inférer les colonnes depuis le modèle: {e}")
+        except Exception:
+            pass
 
-    # 3) Fallback : adapter aux colonnes de ton dashboard
-    _expected_columns_cache = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "DAYS_BIRTH"]
+    # 3) par défaut : aucune (le front affichera un message)
+    _expected_columns_cache = []
     return _expected_columns_cache
 
-# =========================
-# Utilitaires
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+# ------------------------------------------------------------------------------
+# Endpoints
+# ------------------------------------------------------------------------------
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/expected_columns")
+def expected_columns() -> List[str]:
+    cols = _load_expected_columns()
+    return cols
+
+
+@app.post("/predict")
+def predict(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Endpoint minimaliste.
+    - Si aucun modèle n’est dispo, renvoie une proba heuristique stable (fallback),
+      pour ne pas casser le dashboard pendant l’intégration.
+    - Le front s’attend à recevoir: {"probability": float, "decision": int}
+    """
+    cols = _load_expected_columns()
+
+    # Heuristique simple (fallback) : si variables clés présentes on calcule une proba naïve
+    # Tu pourras brancher ici ton vrai modèle quand il sera prêt.
+    # Exemple d’heuristique : ratio CREDIT/INCOME si colonnes existent
+    credit = None
+    income = None
+    # essaie quelques noms courants du dataset Home Credit
+    for k in payload.keys():
+        lk = k.lower()
+        if credit is None and ("credit" in lk or "amt_credit" in lk):
+            credit = _safe_float(payload[k], None)
+        if income is None and ("income" in lk or "amt_income_total" in lk):
+            income = _safe_float(payload[k], None)
+
+    if credit is not None and income is not None and income > 0:
+        ratio = credit / income
+        # borne la proba entre 0.01 et 0.99
+        prob = max(0.01, min(0.99, 0.2 + 0.6 * (ratio / (ratio + 1.0))))
+    else:
+        # fallback constant si pas de features utilisables
+        prob = 0.5
+
+    threshold = 0.5
+    decision = int(prob >= threshold)
+
+    return {
+        "probability": float(prob),
+        "decision": decision,
+        "threshold": threshold,
+        "used_columns_count": len(cols),
+    }
+
+
+@app.post("/predict_proba_batch")
+def predict_proba_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Attendu par le mode batch du dashboard.
+    payload: {"instances": [ {feature: value, ...}, ... ]}
+    """
+    instances = payload.get("instances")
+    if not isinstance(instances, list):
+        raise HTTPException(status_code=400, detail="Body must contain a list under 'instances'.")
+
+    results: List[float] = []
+    for row in instances:
+        results.append(predict(row)["probability"])  # réutilise la logique fallback
+
+    return {"probabilities": results, "count": len(results)}
