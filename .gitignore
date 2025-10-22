@@ -70,3 +70,11 @@ artifacts/cache/
 # --- Divers ---
 *.tmp
 *.bak
+
+kaggle.json
+.kaggle/
+**/kaggle.json
+data/*.csv
+data/*.zip
+artifacts/*.csv
+artifacts/*.json
