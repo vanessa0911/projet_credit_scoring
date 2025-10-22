@@ -1,387 +1,190 @@
 # streamlit_app.py
-# --------------------------------------------------------
-# Dashboard Streamlit pour le projet credit_scoring
-# - API URL configurable (sidebar)
-# - Healthcheck + statut clair
-# - Récupération des colonnes attendues (cache)
-# - Formulaire dynamique pour une prédiction unitaire
-# - Upload CSV pour les prédictions en lot (batch)
-# - Lecture optionnelle des artefacts locaux (artifacts/)
-# - Gestion d'erreurs robuste (try/except + messages clairs)
-# --------------------------------------------------------
-
-from __future__ import annotations
-
+import os
 import io
 import json
-import os
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
-import pandas as pd
 import requests
+import pandas as pd
 import streamlit as st
 
+# -----------------------------
+# Config UI
+# -----------------------------
+st.set_page_config(page_title="Credit Scoring Dashboard", layout="wide")
 
-# =========================
-# --------- Utils ---------
-# =========================
+st.title("📊 Credit Scoring — Dashboard")
 
-def _default_api_url() -> str:
-    # Permet aussi de surcharger via une variable d'environnement
-    return os.environ.get("API_URL", "http://127.0.0.1:8000")
+# -----------------------------
+# Sidebar: API URL + helpers
+# -----------------------------
+DEFAULT_API = os.getenv("API_URL", "http://127.0.0.1:8000")
+api_url = st.sidebar.text_input("URL de l'API", st.session_state.get("api_url", DEFAULT_API))
+api_url = api_url.rstrip("/")  # normaliser (pas de / final)
+if "api_url" not in st.session_state or st.session_state["api_url"] != api_url:
+    st.session_state["api_url"] = api_url
 
+def api_get(path: str, **kwargs):
+    url = f"{st.session_state['api_url']}{path}"
+    r = requests.get(url, timeout=15, **kwargs)
+    r.raise_for_status()
+    return r
 
-@st.cache_data(ttl=10)
-def check_api_health(api_url: str) -> Tuple[bool, Dict[str, Any] | None, str | None]:
-    """Ping l'API (GET /) pour vérifier qu'elle répond."""
-    try:
-        r = requests.get(f"{api_url}/", timeout=5)
-        r.raise_for_status()
-        return True, r.json() if r.headers.get("content-type", "").startswith("application/json") else {"status": r.text}, None
-    except Exception as e:
-        return False, None, str(e)
+def api_post(path: str, json: Dict[str, Any] | None = None, **kwargs):
+    url = f"{st.session_state['api_url']}{path}"
+    r = requests.post(url, json=json, timeout=30, **kwargs)
+    r.raise_for_status()
+    return r
 
-
-@st.cache_data(ttl=300)
-def get_expected_columns(api_url: str) -> Tuple[List[str] | None, str | None]:
-    """Récupère la liste des colonnes attendues (GET /expected_columns)."""
-    try:
-        r = requests.get(f"{api_url}/expected_columns", timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        # On accepte plusieurs formats: {"columns": [...]}, ["..."], {"expected_columns":[...]}
-        if isinstance(data, dict):
-            cols = data.get("columns") or data.get("expected_columns")
-        elif isinstance(data, list):
-            cols = data
-        else:
-            cols = None
-        if cols and all(isinstance(c, str) for c in cols):
-            return cols, None
-        return None, "Réponse inattendue du endpoint /expected_columns."
-    except Exception as e:
-        return None, str(e)
-
-
-def _try_predict(api_url: str, payload: Dict[str, Any]) -> Tuple[Dict[str, Any] | None, str | None]:
-    """POST /predict avec différentes formes de payload pour s'adapter à l'API."""
-    urls = [f"{api_url}/predict", f"{api_url}/predict_proba", f"{api_url}/predict_proba_single"]
-    # Essaye plusieurs schémas classiques : {"features": ...}, {"data": ...}, {...}
-    candidate_bodies = [
-        {"features": payload},
-        {"data": payload},
-        payload,
-    ]
-    for url in urls:
-        for body in candidate_bodies:
-            try:
-                r = requests.post(url, json=body, timeout=20)
-                if r.status_code == 404:
-                    # endpoint absent -> essaie le suivant
-                    continue
-                r.raise_for_status()
-                # Retourne le JSON tel quel (plus flexible)
-                return r.json(), None
-            except requests.exceptions.HTTPError as he:
-                # 422 = payload schema mismatch -> essaie une autre forme
-                if r is not None and r.status_code in (400, 404, 415, 422):
-                    continue
-                return None, f"Erreur HTTP depuis {url}: {he}"
-            except Exception as e:
-                # Timeout/connexion -> ne casse pas tout de suite, on essaie l'autre forme
-                continue
-    return None, "Impossible d'appeler /predict avec les schémas standards (features/data). Vérifie l'API."
-
-
-def _try_predict_batch(api_url: str, df: pd.DataFrame) -> Tuple[pd.DataFrame | None, str | None]:
-    """
-    Tente /predict_proba_batch de trois façons :
-    A) multipart (fichier CSV)
-    B) JSON {"rows":[{...}, ...]}
-    C) Fallback : boucle sur /predict ligne à ligne
-    """
-    # A) multipart CSV
-    try:
-        buf = io.StringIO()
-        df.to_csv(buf, index=False)
-        buf.seek(0)
-        files = {"file": ("input.csv", buf.getvalue(), "text/csv")}
-        url = f"{api_url}/predict_proba_batch"
-        r = requests.post(url, files=files, timeout=60)
-        if r.status_code not in (404, 415):
-            r.raise_for_status()
-            data = r.json()
-            # Formats acceptés : {"predictions":[...]} ou {"proba":[...]} ou direct [...]
-            if isinstance(data, dict):
-                preds = data.get("predictions") or data.get("proba") or data.get("result")
-            else:
-                preds = data
-            if isinstance(preds, list) and len(preds) == len(df):
-                out = df.copy()
-                # nom de colonne robuste
-                out["proba_default"] = [float(x) if x is not None else None for x in preds]
-                return out, None
-    except Exception:
-        pass
-
-    # B) JSON rows
-    try:
-        url = f"{api_url}/predict_proba_batch"
-        body = {"rows": df.to_dict(orient="records")}
-        r = requests.post(url, json=body, timeout=60)
-        if r.status_code != 404:
-            r.raise_for_status()
-            data = r.json()
-            preds = None
-            if isinstance(data, dict):
-                preds = data.get("predictions") or data.get("proba") or data.get("result")
-            else:
-                preds = data
-            if isinstance(preds, list) and len(preds) == len(df):
-                out = df.copy()
-                out["proba_default"] = [float(x) if x is not None else None for x in preds]
-                return out, None
-    except Exception:
-        pass
-
-    # C) Fallback ligne à ligne
-    try:
-        results = []
-        for _, row in df.iterrows():
-            payload = row.to_dict()
-            j, err = _try_predict(api_url, payload)
-            if j is None:
-                results.append(None)
-                continue
-            # Cherche une proba dans des clés usuelles
-            proba = None
-            for k in ("proba", "probability", "score", "proba_default", "p_default", "y_proba"):
-                if k in j:
-                    proba = j[k]
-                    break
-            # Sinon, si dict avec "prediction": 0/1, garde quand même quelque chose
-            if proba is None and "prediction" in j:
-                proba = float(j["prediction"])
-            results.append(proba)
-        out = df.copy()
-        out["proba_default"] = results
-        return out, None
-    except Exception as e:
-        return None, f"Échec du fallback batch: {e}"
-
-
-def _coerce_value(s: str) -> Any:
-    """Convertit proprement une saisie texte en nombre si possible, sinon garde la chaîne."""
-    s = s.strip()
-    if s == "":
-        return None
-    # Int ?
-    try:
-        if s.isdigit() or (s[0] in "+-" and s[1:].isdigit()):
-            return int(s)
-    except Exception:
-        pass
-    # Float ?
-    try:
-        return float(s.replace(",", "."))  # tolère les virgules
-    except Exception:
-        return s
-
-
-# =========================
-# ---------  UI  ----------
-# =========================
-
-st.set_page_config(page_title="Credit Scoring – Dashboard", layout="wide")
-
-st.title("📊 Credit Scoring – Dashboard")
-
+# -----------------------------
+# Health + Expected Columns
+# -----------------------------
 with st.sidebar:
-    st.header("⚙️ Paramètres")
-    api_url = st.text_input(
-        "URL de l'API",
-        value=_default_api_url(),
-        help="Exemple: http://127.0.0.1:8000 (en Codespaces, c'est correct par défaut).",
-    )
+    st.subheader("État de l'API")
 
-    ok, health, err = check_api_health(api_url)
-    if ok:
-        st.success("API: ✅ joignable")
-        if health:
-            st.caption(f"Health: {json.dumps(health)[:200]}{'...' if len(json.dumps(health))>200 else ''}")
-    else:
-        st.error("API: ❌ non joignable")
-        if err:
-            st.caption(err)
+    api_ok = False
+    health_payload = None
 
-    cols, cols_err = get_expected_columns(api_url)
-    if cols:
-        st.success(f"Colonnes attendues: {len(cols)} trouvées")
-        with st.expander("Voir la liste des colonnes"):
-            st.code("\n".join(cols))
-    else:
-        st.warning("Impossible de récupérer /expected_columns.")
-        if cols_err:
-            st.caption(cols_err)
+    try:
+        # On cible explicitement /health (existe dans l'API)
+        health_payload = api_get("/health").json()
+        api_ok = True
+        st.success("API: ✅ joignable", icon="✅")
+        st.caption(f"Health: {json.dumps(health_payload, ensure_ascii=False)}")
+    except Exception as e:
+        st.error("API: ❌ non joignable", icon="🚫")
+        st.caption(str(e))
 
-# --- Tabs principales
-tab_single, tab_batch, tab_artifacts = st.tabs(["🔎 Évaluation unitaire", "📁 Évaluation en lot (CSV)", "📚 Artefacts & interprétabilité"])
+    st.markdown("---")
+    st.caption("Astuce: en Codespaces, utilise l’URL *githubpreview.dev* du port 8000.")
 
-# --------------------------------------------------------
-#                   Tab 1 : Unitaire
-# --------------------------------------------------------
-with tab_single:
-    st.subheader("Évaluation d'un dossier (unitaire)")
-    st.write("Renseigne les caractéristiques du client/dossier selon les colonnes attendues par l'API.")
+# Récupérer les colonnes attendues (si possible)
+expected_cols: List[str] = []
+cols_msg_placeholder = st.empty()
+try:
+    if api_ok:
+        expected_cols = api_get("/expected_columns").json()
+        with cols_msg_placeholder.container():
+            if expected_cols:
+                st.info(f"🧾 Colonnes attendues: {len(expected_cols)}", icon="ℹ️")
+                st.code(", ".join(expected_cols[:50]) + (" ..." if len(expected_cols) > 50 else ""), language="text")
+            else:
+                st.warning("Aucune colonne attendue retournée (dataset non présent côté API ?).", icon="⚠️")
+except Exception as e:
+    with cols_msg_placeholder.container():
+        st.error(f"Impossible de récupérer /expected_columns : {e}", icon="🚫")
 
-    # Formulaire dynamique :
-    # - Si on connaît les colonnes, on les utilise
-    # - Sinon, proposer 3 champs courants en fallback
-    input_data: Dict[str, Any] = {}
+st.markdown("---")
 
-    if cols:
-        st.info("Champs dynamiques construits à partir de /expected_columns.")
-        # On affiche en 2 colonnes pour compacité
-        left, right = st.columns(2)
-        inputs = {}
-        for i, c in enumerate(cols):
-            placeholder = "Valeur (numérique ou texte)"
-            # Heuristiques légères pour proposer un placeholder pertinent
-            if any(k in c.lower() for k in ("age", "days", "annee", "year")):
-                placeholder = "Ex: 35"
-            elif any(k in c.lower() for k in ("amount", "amt", "credit", "loan", "revenue", "income", "montant")):
-                placeholder = "Ex: 12000"
-            container = left if i % 2 == 0 else right
-            val = container.text_input(c, value="", placeholder=placeholder)
-            inputs[c] = _coerce_value(val)
-        input_data = inputs
-    else:
-        st.info("Fallback minimal (liste des colonnes inconnue).")
-        c1, c2, c3 = st.columns(3)
-        age = c1.text_input("age", value="35")
-        amt = c2.text_input("credit_amount", value="12000")
-        income = c3.text_input("annual_income", value="48000")
-        input_data = {
-            "age": _coerce_value(age),
-            "credit_amount": _coerce_value(amt),
-            "annual_income": _coerce_value(income),
-        }
+# -----------------------------
+# Colonne gauche: Prédiction unitaire
+# -----------------------------
+left, right = st.columns(2)
 
-    if st.button("🚀 Évaluer ce dossier", type="primary"):
-        with st.spinner("Appel de l'API…"):
-            res, err = _try_predict(api_url, input_data)
-        if err:
-            st.error(err)
-        elif res is None:
-            st.error("Réponse vide de l'API.")
+with left:
+    st.subheader("🔮 Prédiction unitaire")
+
+    st.caption("Renseigne au minimum le **revenu** et le **montant de crédit**. "
+               "Les noms correspondent au dataset Home Credit.")
+
+    # Champs les plus utiles pour le fallback de l'API:
+    amt_income_total = st.number_input("AMT_INCOME_TOTAL (revenu total)", min_value=0.0, step=100.0, value=120000.0)
+    amt_credit = st.number_input("AMT_CREDIT (montant du crédit)", min_value=0.0, step=100.0, value=200000.0)
+    # Champs additionnels optionnels (le fallback ne les utilise pas mais on les expose à titre d’exemple)
+    age_years = st.number_input("AGE (années) [optionnel]", min_value=0, max_value=120, step=1, value=35)
+
+    if st.button("Évaluer ce dossier", use_container_width=True, type="primary", disabled=not api_ok):
+        if not api_ok:
+            st.error("API indisponible. Vérifie l’URL dans la sidebar.")
         else:
-            st.success("Prédiction reçue")
-            st.json(res)
+            # Crée un payload minimal compatible avec l'heuristique fallback (income/credit)
+            payload: Dict[str, Any] = {
+                "AMT_INCOME_TOTAL": amt_income_total,
+                "AMT_CREDIT": amt_credit,
+                "AGE_YEARS": age_years,  # illustratif
+            }
 
-            # Affichage pratique si quelques clés usuelles existent
-            proba = None
-            for k in ("proba", "probability", "score", "proba_default", "p_default", "y_proba"):
-                if k in res:
-                    proba = res[k]
-                    break
-            pred = res.get("prediction") if isinstance(res, dict) else None
+            # Si l'API a fourni une liste de colonnes, on peut remplir à None celles non fournies
+            if expected_cols:
+                for c in expected_cols:
+                    if c not in payload:
+                        payload[c] = None
 
-            if proba is not None:
-                st.metric("Probabilité de défaut", f"{float(proba):.3f}")
-            if pred is not None:
-                st.metric("Décision / Classe", str(pred))
+            try:
+                resp = api_post("/predict", json=payload).json()
+                prob = float(resp.get("probability", 0.0))
+                decision = int(resp.get("decision", 0))
+                threshold = float(resp.get("threshold", 0.5))
 
-# --------------------------------------------------------
-#                   Tab 2 : Batch CSV
-# --------------------------------------------------------
-with tab_batch:
-    st.subheader("Prédictions en lot (CSV)")
-    st.write("Charge un fichier CSV dont les **colonnes correspondent** à `/expected_columns`.")
-    file = st.file_uploader("Choisir un fichier CSV", type=["csv"])
+                st.success("Prédiction obtenue ✅")
+                mcol1, mcol2, mcol3 = st.columns(3)
+                mcol1.metric("Probabilité défaut", f"{prob:.3f}")
+                mcol2.metric("Seuil décision", f"{threshold:.2f}")
+                mcol3.metric("Décision", "Refuser" if decision == 1 else "Accorder")
 
-    if file is not None:
+                with st.expander("Détails de la réponse"):
+                    st.json(resp)
+            except Exception as e:
+                st.error(f"Erreur lors de l'appel à /predict : {e}")
+
+# -----------------------------
+# Colonne droite: Prédictions en lot (CSV)
+# -----------------------------
+with right:
+    st.subheader("📦 Prédictions en lot (CSV)")
+    st.caption("Charge un CSV avec une ligne par dossier. "
+               "Si des colonnes manquent par rapport à /expected_columns, elles seront complétées à None.")
+
+    file = st.file_uploader("Fichier CSV", type=["csv"], accept_multiple_files=False, help="Dépose ton fichier ici.")
+    if file is not None and api_ok:
         try:
-            df = pd.read_csv(file)
-        except Exception as e:
-            st.error(f"Impossible de lire le CSV: {e}")
-            df = None
+            # Lecture CSV
+            content = file.read()
+            df = pd.read_csv(io.BytesIO(content))
 
-        if df is not None:
-            st.write("Aperçu des données :")
+            st.write("Aperçu CSV chargé :")
             st.dataframe(df.head(20), use_container_width=True)
 
-            if st.button("🚀 Lancer la prédiction en lot"):
-                with st.spinner("Appel batch en cours…"):
-                    out, err = _try_predict_batch(api_url, df)
-                if err:
-                    st.error(err)
-                elif out is None:
-                    st.error("Réponse vide en batch.")
-                else:
-                    st.success("Prédictions lot reçues")
+            # Harmoniser avec expected_cols si connues
+            instances: List[Dict[str, Any]] = df.to_dict(orient="records")
+            if expected_cols:
+                normed_instances = []
+                for row in instances:
+                    normed_row = {c: row.get(c, None) for c in expected_cols}
+                    normed_instances.append(normed_row)
+                instances = normed_instances
+
+            # Envoi à l'API
+            if st.button("Lancer les prédictions en lot", use_container_width=True):
+                try:
+                    resp = api_post("/predict_proba_batch", json={"instances": instances}).json()
+                    probs = resp.get("probabilities", [])
+                    out = df.copy()
+                    out["probability"] = probs
+                    out["decision"] = (out["probability"] >= 0.5).astype(int)
+
+                    st.success(f"Prédictions OK ({len(probs)} lignes)")
                     st.dataframe(out.head(50), use_container_width=True)
-                    # Proposition de téléchargement
+
+                    # Téléchargement
                     csv_bytes = out.to_csv(index=False).encode("utf-8")
                     st.download_button(
-                        "💾 Télécharger résultats (CSV)",
+                        label="⬇️ Télécharger les résultats (CSV)",
                         data=csv_bytes,
-                        file_name="predictions_batch.csv",
+                        file_name="predictions.csv",
                         mime="text/csv",
+                        use_container_width=True,
                     )
-
-# --------------------------------------------------------
-#         Tab 3 : Artefacts & Interprétabilité
-# --------------------------------------------------------
-with tab_artifacts:
-    st.subheader("Artefacts (optionnel)")
-    st.caption("Si tu as généré les artefacts en local (scripts `make_*.py`), ils seront affichés ici.")
-
-    artifacts_dir = Path("artifacts")
-    ref_stats_path = artifacts_dir / "ref_stats.json"
-    glob_imp_path = artifacts_dir / "global_importance.csv"
-    interp_summary_path = artifacts_dir / "interpretability_summary.json"
-
-    if ref_stats_path.exists():
-        st.success("✅ ref_stats.json trouvé")
-        try:
-            ref_stats = json.loads(ref_stats_path.read_text(encoding="utf-8"))
-            st.write("**Statistiques de référence (extrait)**")
-            # On affiche uniquement les 3000 premiers caractères pour éviter l'inondation
-            dump = json.dumps(ref_stats, ensure_ascii=False)[:3000]
-            st.code(dump + ("..." if len(json.dumps(ref_stats)) > 3000 else ""))
+                except Exception as e:
+                    st.error(f"Erreur lors de l'appel à /predict_proba_batch : {e}")
         except Exception as e:
-            st.error(f"Lecture de ref_stats.json impossible: {e}")
-    else:
-        st.info("ref_stats.json non trouvé. Lance `python make_ref_stats.py` si besoin.")
+            st.error(f"Impossible de lire le CSV : {e}")
 
-    if glob_imp_path.exists():
-        st.success("✅ global_importance.csv trouvé")
-        try:
-            gi = pd.read_csv(glob_imp_path)
-            st.write("**Importance globale des variables (top 30)**")
-            # On essaie d'interpréter des colonnes typiques: feature / importance
-            cols_gi = [c.lower() for c in gi.columns]
-            # Recherche de noms usuels
-            feat_col = next((c for c in gi.columns if c.lower() in ("feature", "variable", "name")), gi.columns[0])
-            imp_col = next((c for c in gi.columns if "imp" in c.lower() or "gain" in c.lower() or "weight" in c.lower()), gi.columns[-1])
-            gi_show = gi[[feat_col, imp_col]].rename(columns={feat_col: "feature", imp_col: "importance"}).copy()
-            gi_show = gi_show.sort_values("importance", ascending=False).head(30)
-            st.dataframe(gi_show, use_container_width=True)
-            st.bar_chart(gi_show.set_index("feature"))
-        except Exception as e:
-            st.error(f"Lecture de global_importance.csv impossible: {e}")
-    else:
-        st.info("global_importance.csv non trouvé. Lance `python make_global_importance.py` si besoin.")
-
-    if interp_summary_path.exists():
-        st.success("✅ interpretability_summary.json trouvé")
-        try:
-            inter = json.loads(interp_summary_path.read_text(encoding="utf-8"))
-            st.write("**Interprétabilité – résumé (extrait)**")
-            dump = json.dumps(inter, ensure_ascii=False)[:3000]
-            st.code(dump + ("..." if len(json.dumps(inter)) > 3000 else ""))
-        except Exception as e:
-            st.error(f"Lecture d'interpretability_summary.json impossible: {e}")
-    else:
-        st.info("interpretability_summary.json non trouvé (optionnel).")
+# -----------------------------
+# Footer infos
+# -----------------------------
+st.markdown("---")
+st.caption(
+    "Conseil : en Codespaces, mets l’URL du port 8000 (githubpreview.dev) dans la sidebar. "
+    "Si /expected_columns est vide, le dashboard fonctionne quand même (fallback côté API)."
+)
