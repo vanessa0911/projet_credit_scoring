@@ -1,22 +1,23 @@
 # api.py
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import json
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.routing import APIRoute
 
 # ------------------------------------------------------------------------------
-# App + CORS (nécessaire pour l'appel depuis le dashboard Streamlit en Codespaces)
+# App + CORS
 # ------------------------------------------------------------------------------
 app = FastAPI(title="Credit Scoring API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # en Codespaces on ouvre largement; à restreindre si besoin
+    allow_origins=["*"],        # Codespaces: on ouvre largement; à restreindre si besoin
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -37,16 +38,17 @@ _expected_columns_cache: Optional[List[str]] = None
 # ------------------------------------------------------------------------------
 def _load_expected_columns() -> List[str]:
     """
-    Stratégie simple et robuste pour obtenir les colonnes d'entrée attendues :
-    1) Si data/application_train.csv existe, on lit l'en-tête (nrows=0)
-    2) Sinon, si artifacts/ref_stats.json existe, on tente de combiner les listes connues
-    3) Sinon, on renvoie [] (le front gère ce cas)
+    Récupère la liste des colonnes d'entrée attendues.
+    Ordre de priorité:
+      1) en-tête du CSV d'entraînement (si présent)
+      2) artefacts/ref_stats.json (si présent)
+      3) fallback minimal (fonctionne sans dataset)
     """
     global _expected_columns_cache
     if _expected_columns_cache is not None:
         return _expected_columns_cache
 
-    # 1) depuis le CSV d'entraînement
+    # 1) depuis le CSV (le plus fiable si présent)
     if DATA_CSV.exists():
         try:
             df_head = pd.read_csv(DATA_CSV, nrows=0)
@@ -55,7 +57,7 @@ def _load_expected_columns() -> List[str]:
         except Exception:
             pass
 
-    # 2) depuis les artefacts récap
+    # 2) depuis les artefacts
     if REF_STATS_JSON.exists():
         try:
             with open(REF_STATS_JSON, "r", encoding="utf-8") as f:
@@ -70,8 +72,8 @@ def _load_expected_columns() -> List[str]:
         except Exception:
             pass
 
-    # 3) défaut
-    _expected_columns_cache = []
+    # 3) fallback minimal pour que le dashboard soit exploitable sans dataset
+    _expected_columns_cache = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "AGE_YEARS"]
     return _expected_columns_cache
 
 
@@ -84,8 +86,8 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
 
 def _fallback_probability(features: Dict[str, Any]) -> float:
     """
-    Fallback déterministe pour permettre au front de fonctionner sans modèle.
-    Heuristique simple basée sur ratio CREDIT/INCOME si disponible.
+    Fallback déterministe pour dev/démo (sans modèle).
+    Heuristique simple basée sur le ratio CREDIT/INCOME si disponible.
     """
     credit = None
     income = None
@@ -105,6 +107,10 @@ def _fallback_probability(features: Dict[str, Any]) -> float:
     return float(prob)
 
 
+def _endpoint_list() -> List[str]:
+    return [r.path for r in app.routes if isinstance(r, APIRoute)]
+
+
 # ------------------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------------------
@@ -113,19 +119,17 @@ def root() -> Dict[str, Any]:
     return {
         "status": "ok",
         "name": "Credit Scoring API",
-        "endpoints": [
-            "/",
-            "/health",
-            "/expected_columns",
-            "/predict",
-            "/predict_proba_batch",
-        ],
+        "endpoints": _endpoint_list(),
     }
 
 
 @app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "name": "Credit Scoring API",
+        "endpoints": _endpoint_list(),
+    }
 
 
 @app.get("/expected_columns")
@@ -175,10 +179,9 @@ def predict_proba_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------
-# Entrée locale (facultatif)
+# Entrée directe (facultatif)
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Permet un run direct: python api.py
     import uvicorn
 
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
