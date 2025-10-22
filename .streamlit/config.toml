@@ -1,5 +1,28 @@
 [server]
+# Adresse réseau : "0.0.0.0" permet à Streamlit d'être accessible depuis le container (Codespaces)
 address = "0.0.0.0"
+
+# Port utilisé par Streamlit (doit correspondre à celui ouvert dans le devcontainer)
 port = 8501
-enableCORS = false
+
+# Exécution sans interface graphique (obligatoire dans un container)
 headless = true
+
+# Désactivation des protections inter-domaines (pour que Streamlit puisse communiquer avec l'API FastAPI)
+enableCORS = false
+enableXsrfProtection = false
+
+[theme]
+# Thème par défaut (optionnel, tu peux le modifier selon tes préférences)
+base = "light"
+primaryColor = "#2b5797"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f5f5"
+textColor = "#000000"
+font = "sans serif"
+
+[browser]
+# Ouvre l’app dans un nouvel onglet du navigateur par défaut de Codespaces
+gatherUsageStats = false
+serverAddress = "localhost"
+serverPort = 8501
