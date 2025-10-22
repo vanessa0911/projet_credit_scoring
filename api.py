@@ -17,7 +17,7 @@ app = FastAPI(title="Credit Scoring API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # Codespaces: on ouvre largement; à restreindre si besoin
+    allow_origins=["*"],  # Pour Codespaces : on laisse tout ouvert
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,26 +34,28 @@ _expected_columns_cache: Optional[List[str]] = None
 
 
 # ------------------------------------------------------------------------------
-# Utilitaires
+# Fonctions utilitaires
 # ------------------------------------------------------------------------------
 def _load_expected_columns() -> List[str]:
     """
     Récupère la liste des colonnes d'entrée attendues.
-    Ordre de priorité:
-      1) en-tête du CSV d'entraînement (si présent)
-      2) artefacts/ref_stats.json (si présent)
-      3) fallback minimal (fonctionne sans dataset)
+    Ordre de priorité :
+      1) en-tête du CSV si présent et non vide
+      2) artefacts/ref_stats.json si non vide
+      3) fallback minimal (3 colonnes)
     """
     global _expected_columns_cache
     if _expected_columns_cache is not None:
         return _expected_columns_cache
 
-    # 1) depuis le CSV (le plus fiable si présent)
+    # 1) depuis le CSV
     if DATA_CSV.exists():
         try:
             df_head = pd.read_csv(DATA_CSV, nrows=0)
-            _expected_columns_cache = list(df_head.columns)
-            return _expected_columns_cache
+            cols = list(df_head.columns)
+            if cols:
+                _expected_columns_cache = cols
+                return _expected_columns_cache
         except Exception:
             pass
 
@@ -64,15 +66,18 @@ def _load_expected_columns() -> List[str]:
                 ref = json.load(f)
             cols: List[str] = []
             for key in ("numerical_columns", "categorical_columns", "all_columns"):
-                if isinstance(ref.get(key), list):
-                    cols.extend(ref[key])
-            # dédoublonne en conservant l'ordre
-            _expected_columns_cache = list(dict.fromkeys(cols))
-            return _expected_columns_cache
+                v = ref.get(key)
+                if isinstance(v, list):
+                    cols.extend(v)
+            # Dédoublonner et filtrer le vide
+            cols = [c for c in dict.fromkeys(cols) if isinstance(c, str) and c.strip()]
+            if cols:
+                _expected_columns_cache = cols
+                return _expected_columns_cache
         except Exception:
             pass
 
-    # 3) fallback minimal pour que le dashboard soit exploitable sans dataset
+    # 3) fallback minimal
     _expected_columns_cache = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "AGE_YEARS"]
     return _expected_columns_cache
 
@@ -86,8 +91,8 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
 
 def _fallback_probability(features: Dict[str, Any]) -> float:
     """
-    Fallback déterministe pour dev/démo (sans modèle).
-    Heuristique simple basée sur le ratio CREDIT/INCOME si disponible.
+    Fallback déterministe pour démonstration.
+    Heuristique simple basée sur le ratio CREDIT/INCOME.
     """
     credit = None
     income = None
@@ -100,7 +105,6 @@ def _fallback_probability(features: Dict[str, Any]) -> float:
 
     if credit is not None and income is not None and income > 0:
         ratio = credit / income
-        # borne entre 0.01 et 0.99 pour éviter 0/1 stricts
         prob = max(0.01, min(0.99, 0.2 + 0.6 * (ratio / (ratio + 1.0))))
     else:
         prob = 0.5
@@ -108,6 +112,7 @@ def _fallback_probability(features: Dict[str, Any]) -> float:
 
 
 def _endpoint_list() -> List[str]:
+    """Retourne la liste des endpoints exposés (pour /health et /)."""
     return [r.path for r in app.routes if isinstance(r, APIRoute)]
 
 
@@ -140,13 +145,12 @@ def expected_columns() -> List[str]:
 @app.post("/predict")
 def predict(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Corps attendu: {feature_name: value, ...}
-    Réponse: {"probability": float, "decision": int, "threshold": float, ...}
+    Corps attendu : {feature_name: value, ...}
+    Réponse : {"probability": float, "decision": int, "threshold": float}
     """
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Body must be a JSON object with feature:value pairs.")
+        raise HTTPException(status_code=400, detail="Le corps doit être un objet JSON {clé: valeur}.")
 
-    # TODO: brancher ici le vrai pipeline (preprocess + model.predict_proba)
     prob = _fallback_probability(payload)
     threshold = 0.5
     decision = int(prob >= threshold)
@@ -162,24 +166,24 @@ def predict(payload: Dict[str, Any]) -> Dict[str, Any]:
 @app.post("/predict_proba_batch")
 def predict_proba_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Corps attendu: {"instances": [ {feature: value, ...}, ... ]}
-    Réponse: {"probabilities": [float, ...], "count": int}
+    Corps attendu : {"instances": [ {feature: value, ...}, ... ]}
+    Réponse : {"probabilities": [float, ...], "count": int}
     """
     instances = payload.get("instances")
     if not isinstance(instances, list):
-        raise HTTPException(status_code=400, detail="Body must contain a list under 'instances'.")
+        raise HTTPException(status_code=400, detail="Le corps doit contenir une liste 'instances'.")
 
     probs: List[float] = []
     for row in instances:
         if not isinstance(row, dict):
-            raise HTTPException(status_code=400, detail="Each instance must be a JSON object.")
+            raise HTTPException(status_code=400, detail="Chaque instance doit être un objet JSON.")
         probs.append(_fallback_probability(row))
 
     return {"probabilities": probs, "count": len(probs)}
 
 
 # ------------------------------------------------------------------------------
-# Entrée directe (facultatif)
+# Exécution directe
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
