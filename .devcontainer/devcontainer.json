@@ -1,23 +1,27 @@
 {
-  "name": "credit-scoring (py3.12)",
+  "name": "projet-credit-scoring",
   "features": {
-    "ghcr.io/devcontainers/features/python:1": {
-      "version": "3.12"
-    }
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.12" },
+    "ghcr.io/devcontainers/features/git-lfs:1": {}
   },
   "forwardPorts": [8000, 8501],
-  "postCreateCommand": "python -m pip install --upgrade pip setuptools wheel && pip install -r requirements.txt --no-cache-dir",
+  "portsAttributes": {
+    "8000": { "label": "FastAPI (uvicorn)", "onAutoForward": "openBrowser" },
+    "8501": { "label": "Streamlit", "onAutoForward": "openBrowser" }
+  },
+  "postCreateCommand": "git lfs install && git lfs pull || true && python -m pip install --upgrade pip setuptools wheel && pip install -r requirements.txt --no-cache-dir",
   "customizations": {
     "vscode": {
-      "settings": {
-        "python.defaultInterpreterPath": "/usr/local/bin/python",
-        "terminal.integrated.defaultProfile.linux": "bash"
-      },
       "extensions": [
         "ms-python.python",
         "ms-python.vscode-pylance",
         "ms-toolsai.jupyter"
-      ]
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
     }
-  }
+  },
+  "remoteUser": "vscode"
 }
