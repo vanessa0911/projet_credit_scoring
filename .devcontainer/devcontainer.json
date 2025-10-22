@@ -15,8 +15,6 @@
     "8501": { "label": "Streamlit", "onAutoForward": "openBrowser" }
   },
 
-  "postCreateCommand": "git lfs install && git lfs pull || true && python -m pip install --upgrade pip setuptools wheel && pip install -r requirements.txt --no-cache-dir",
-
   "customizations": {
     "vscode": {
       "extensions": [
@@ -29,5 +27,7 @@
         "terminal.integrated.defaultProfile.linux": "bash"
       }
     }
-  }
+  },
+
+  "postCreateCommand": "bash -lc '\nset -euo pipefail\n\n# 0) Outils système requis\nif ! command -v unzip >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y unzip; fi\n\n# 1) Deps Python & Kaggle CLI\npython -m pip install --upgrade pip setuptools wheel\npip install --no-cache-dir -r requirements.txt || true\npip install --no-cache-dir kaggle\n\n# 2) Installe la clé Kaggle depuis le secret KAGGLE_JSON_B64\nmkdir -p ~/.kaggle\nif [ -n \"${KAGGLE_JSON_B64:-}\" ]; then\n  echo \"$KAGGLE_JSON_B64\" | base64 -d > ~/.kaggle/kaggle.json\n  chmod 600 ~/.kaggle/kaggle.json\nelse\n  echo \"[WARN] Secret KAGGLE_JSON_B64 absent. Le dataset ne sera pas téléchargé.\"\nfi\n\n# 3) Télécharge le dataset si absent\nmkdir -p data\nif [ ! -f data/application_train.csv ] && [ -f ~/.kaggle/kaggle.json ]; then\n  echo \"[INFO] Téléchargement Kaggle: application_train.csv\"\n  kaggle competitions download -c home-credit-default-risk -f application_train.csv -p data\n  unzip -o data/application_train.csv.zip -d data\n  rm -f data/application_train.csv.zip\nelse\n  echo \"[INFO] Dataset déjà présent ou clé absente.\"\nfi\n'\n"
 }
