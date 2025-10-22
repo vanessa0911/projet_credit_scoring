@@ -1,126 +1,184 @@
-Cheatsheet — Lancer, régénérer, dépanner
-1) Préparer l’environnement
-# Se placer dans le projet + activer le venv
-cd "C:\Users\Maintenant Prêt\Desktop\Projet_credit_scoring"
-.\.venv\Scripts\Activate.ps1
+🧠 Projet Credit Scoring — Dashboard & API
+🎯 Objectif du projet
 
-# Mettre à jour l’outillage + installer les deps figées
-python -m pip install --upgrade pip setuptools wheel
+Ce projet illustre une approche complète de scoring de crédit, depuis la génération des données de référence jusqu’à la visualisation des résultats dans un dashboard Streamlit connecté à une API FastAPI.
+L’objectif est de prédire la probabilité qu’un client rembourse un prêt, et de rendre les décisions explicables et explorables.
+
+🗂️ Structure du dépôt
+projet_credit_scoring/
+├── api.py                         # API FastAPI pour la prédiction et l'explicabilité
+├── streamlit_app.py               # Dashboard Streamlit (interface utilisateur)
+├── make_ref_stats.py              # Script pour générer les stats de référence
+├── make_global_importance.py      # Script pour générer les importances globales
+│
+├── data/                          # Données sources (ex: application_train.csv)
+├── artifacts/                     # Fichiers générés (ref_stats.json, global_importance.csv…)
+│
+├── requirements.txt               # Dépendances Python
+├── .devcontainer/devcontainer.json # Configuration Codespaces (Python, ports, etc.)
+├── .streamlit/config.toml         # Config serveur Streamlit
+└── README.md                      # Ce document
+
+🚀 Lancer le projet dans GitHub Codespaces
+
+🧩 Ces instructions sont destinées aux débutants : tu peux tout faire directement dans GitHub Codespaces, sans rien installer sur ton ordinateur.
+
+1️⃣ Ouvrir le projet
+
+Sur la page GitHub du dépôt → clique sur le bouton vert Code
+
+Sélectionne Create codespace on main
+
+Attends que VS Code (version web) s’ouvre avec le projet
+
+2️⃣ Installation automatique (via devcontainer)
+
+Si ton fichier .devcontainer/devcontainer.json contient :
+
+"postCreateCommand": "git lfs install && git lfs pull || true && pip install --upgrade pip setuptools wheel && pip install -r requirements.txt --no-cache-dir"
+
+
+➡️ L’environnement s’installe automatiquement à la création du Codespace.
+
+Sinon, tu peux le faire manuellement dans le terminal intégré :
+
+git lfs install && git lfs pull || true
+pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt --no-cache-dir
 
-# (optionnel) Variables d’env – utile si l’API n’est pas en local
-$env:API_URL = "http://127.0.0.1:8000"
+3️⃣ Générer les artefacts (si besoin)
 
+Si les fichiers ref_stats.json et global_importance.csv n’existent pas encore :
 
-👉 Vérifier Python : python -V doit renvoyer 3.12.x.
-
-2) (Re)générer les artefacts du dashboard
-# Stats population + features dérivées (écrit artifacts/ref_stats.json)
+mkdir -p data artifacts
 python make_ref_stats.py
-
-# Importances globales (écrit artifacts/global_importance.csv + interpretability_summary.json)
 python make_global_importance.py
 
 
-make_ref_stats.py lit data\application_train.csv (chemin déjà configuré dans le script).
-Si tu changes d’emplacement, adapte TRAIN_CSV dans le script.
+➡️ Les scripts lisent les données du dossier data/ (ex: application_train.csv) et enregistrent les résultats dans artifacts/.
 
-3) Démarrer l’API de scoring (FastAPI)
-python -m uvicorn api:app --reload
+4️⃣ Démarrer l’API FastAPI
 
+L’API fournit les endpoints /predict, /predict_proba_batch, etc.
 
-Smoke tests rapides :
+Lance-la avec :
 
-Invoke-WebRequest http://127.0.0.1:8000/ -UseBasicParsing        # status 200, montre chosen_model & threshold
-Invoke-WebRequest http://127.0.0.1:8000/expected_columns -UseBasicParsing  # doit renvoyer count > 0
+python -m uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 
 
-🧠 Endpoints principaux :
+💡 Codespaces détecte le port 8000 : choisis Open in Browser pour voir l’API en action.
 
-GET / : statut & méta (modèle, seuil…)
+Endpoints principaux :
 
-GET /expected_columns : colonnes d’entrée requises
+Endpoint	Description
+/	Page d’accueil de l’API
+/expected_columns	Liste les variables attendues par le modèle
+/predict	Retourne la prédiction (accordé/refusé) pour un dossier
+/predict_proba_batch	Retourne les probabilités pour un fichier CSV
+5️⃣ Lancer le dashboard Streamlit
 
-POST /predict : {"data": {...}} → proba & décision
+Dans un nouveau terminal (laisse l’API tourner dans le premier) :
 
-POST /predict_proba_batch : {"records":[{...},{...}]} → liste de résultats
-
-4) Lancer le dashboard (Streamlit)
-# Toujours avec le Python du venv :
 python -m streamlit run streamlit_app.py
 
 
-Dans l’UI :
+Codespaces détecte le port 8501 → choisis Open in Browser.
 
-Vérifie l’encart État de l’API (doit être ✅).
+Le fichier .streamlit/config.toml garantit que Streamlit tourne sur le bon hôte :
 
-Renseigne revenu/crédit/âge → clique Évaluer ce dossier.
+[server]
+address = "0.0.0.0"
+port = 8501
+headless = true
+enableCORS = false
+enableXsrfProtection = false
 
-Sections Comparaison population et Variables influentes s’activent si les artefacts sont présents.
+🧭 Utilisation du dashboard
+🔌 Connexion à l’API
 
-Changer l’URL de l’API : dans la sidebar, champ “API URL” (le cache est géré, mise à jour immédiate).
+L’URL par défaut est :
+http://127.0.0.1:8000
 
-5) Mode batch (CSV)
+Si l’état de l’API dans l’encart supérieur affiche ❌, vérifie :
 
-Dans la sidebar du dashboard → Prédictions en lot (CSV) :
+que FastAPI tourne toujours dans le terminal,
 
-envoie un CSV avec les mêmes colonnes que /expected_columns (les colonnes manquantes sont complétées à None).
+que tu as bien ouvert le bon port.
 
-la réponse s’affiche dans un tableau (proba + décision).
+🧍 Mode dossier unique
 
-6) Git — sauvegarder tes modifs
-# Toujours à la racine du projet & venv activé
-git checkout -b feat/dashboard-v1
+Renseigne les valeurs demandées (revenu, montant du crédit, âge, etc.)
 
-# Ajouter les fichiers utiles (pas .venv/ ni data/)
-git add api.py streamlit_app.py make_ref_stats.py make_global_importance.py `
-        requirements.txt .gitignore .gitattributes `
-        artifacts/metadata.json artifacts/ref_stats.json artifacts/global_importance.csv
+Clique sur Évaluer ce dossier
 
-git commit -m "feat: dashboard Streamlit + API robustifiée + artefacts utiles"
-git push -u origin feat/dashboard-v1
+Le résultat s’affiche : probabilité de remboursement + décision automatique
 
+📈 Mode batch (fichier CSV)
 
-Ouvre la PR : https://github.com/vanessa0911/projet_credit_scoring/compare
+Téléverse un fichier .csv via la barre latérale
+→ Il doit contenir les colonnes attendues (/expected_columns)
 
-Gros fichiers : les modèles *.joblib et *.npy sont suivis via Git-LFS (déjà réglé par .gitattributes).
-Si GitHub refuse un push (>100 MB), exécute :
+Le tableau de résultats s’affiche automatiquement.
 
-git lfs install
-git lfs migrate import --include="artifacts/*.joblib,artifacts/*.npy"
-git push --force-with-lease
+🧩 Visualisations
 
-7) Dépannage express
+Comparaison population : place le client dans la distribution des emprunteurs similaires
 
-Streamlit/Pandas/NumPy/Arrow : si tu vois _ARRAY_API ou multiarray → tes versions sont maintenant pinnées dans requirements.txt. Réinstalle :
+Variables influentes : affiche les features les plus déterminantes dans la décision
 
-pip uninstall -y pyarrow numpy pandas
-pip install -r requirements.txt --no-cache-dir
+🧰 Structure logique du projet
+Élément	Rôle
+api.py	Sert les prédictions via FastAPI
+streamlit_app.py	Interface interactive Streamlit
+make_ref_stats.py	Calcule les statistiques de référence
+make_global_importance.py	Calcule les importances globales des features
+artifacts/	Contient les fichiers utilisés par le dashboard
+data/	Données d’entraînement (non versionnées en production)
+🧑‍💻 Dépannage express
+Problème	Solution
+🔴 Erreur multiarray ou _ARRAY_API	Réinstalle ces versions : pandas==2.2.2, numpy==2.1.1, pyarrow==17.0.0
+🔴 L’API n’est pas accessible	Vérifie que FastAPI tourne (uvicorn) et que l’URL de la sidebar est correcte
+🔴 Port occupé	Change le port : --port 8001 ou --port 8502
+🔴 Dashboard vide	Supprime le cache : streamlit cache clear
+🔴 Artefacts manquants	Relance make_ref_stats.py et make_global_importance.py
+🧪 Tests rapides (API)
+# Test de l’endpoint racine
+curl -s http://127.0.0.1:8000/ | jq .
 
+# Vérifier les colonnes attendues
+curl -s http://127.0.0.1:8000/expected_columns | jq .
 
-Port déjà utilisé :
-netstat -ano | findstr :8000 → récupère le PID → taskkill /PID <PID> /F
+📦 Requirements (versions stables recommandées)
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
 
-Cache Streamlit :
-streamlit cache clear
+streamlit==1.38.0
+pandas==2.2.2
+numpy==2.1.1
+pyarrow==17.0.0
+scikit-learn==1.5.2
 
-API non joignable : assure-toi que uvicorn tourne, et que API_URL dans Streamlit pointe bien vers http://127.0.0.1:8000.
+joblib==1.4.2
+matplotlib==3.9.2
+plotly==5.24.1
+requests==2.32.3
 
-expected_columns vide : vérifie artifacts/metadata.json (clé expected_input_columns) ou laisse l’API déduire depuis le modèle; relance uvicorn.
+🧩 Pour aller plus loin
 
-8) Structure du repo (rappel)
-Projet_credit_scoring/
-├─ api.py                     # API FastAPI
-├─ streamlit_app.py           # UI Streamlit
-├─ make_ref_stats.py          # Stats population (ref_stats.json)
-├─ make_global_importance.py  # Importances (global_importance.csv)
-├─ requirements.txt
-├─ .gitignore / .gitattributes (LFS)
-├─ data/                      # (ignoré par Git)
-└─ artifacts/
-   ├─ metadata.json
-   ├─ model_*.joblib         # (via Git-LFS)
-   ├─ feature_names.npy      # (via Git-LFS)
-   ├─ ref_stats.json
-   ├─ global_importance.csv
-   └─ interpretability_summary.json
+Ajouter un modèle plus robuste (XGBoost, LightGBM)
+
+Connecter à une base SQL pour les prédictions en production
+
+Mettre en place une CI/CD pour déploiement automatique sur Render, Deta ou HuggingFace Spaces
+
+🧾 Licence
+
+Projet open source sous licence MIT.
+Tu peux l’utiliser librement à des fins pédagogiques ou démonstratives.
+
+💡 Auteurs & Crédits
+
+Projet développé par Vanessa
+Inspiré par les bonnes pratiques MLOps & DataViz.
+Documentation et pipeline adaptés pour un usage pédagogique complet.
