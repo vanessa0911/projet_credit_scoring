@@ -36,7 +36,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DEFAULT_API_URL = st.secrets.get("API_URL", "http://127.0.0.1:8000")
+# DEFAULT_API_URL: fallback si secrets.toml absent
+try:
+    DEFAULT_API_URL = st.secrets["API_URL"]  # nécessite .streamlit/secrets.toml
+except Exception:
+    DEFAULT_API_URL = "http://127.0.0.1:8000"
 
 # Couleurs
 GREEN = "#059669"  # vert (variables clés, décisions favorables)
@@ -78,7 +82,6 @@ class ApiClient:
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            # tolérance si une clé "columns" est renvoyée
             return list(data.get("columns", []))
         return []
 
@@ -131,13 +134,10 @@ def coerce_value(val: str) -> Any:
     if s == "" or s.lower() in {"nan", "none", "null"}:
         return None
     try:
-        # int ?
         if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
             return int(s)
-        # float ?
         return float(s)
     except Exception:
-        # chaîne (catégorielle)
         return s
 
 def is_gender_feature(name: str) -> bool:
@@ -457,4 +457,3 @@ with TAB_DS:
         - **Interprétabilité globale** : hiérarchie moyenne des facteurs conduisant le modèle.
         """
     )
- 
