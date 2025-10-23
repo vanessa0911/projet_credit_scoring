@@ -1,0 +1,18 @@
+[
+  "gender",
+  "age",
+  "income",
+  "loan_amount",
+  "loan_duration",
+  "employment_years",
+  "credit_history",
+  "housing",
+  "marital_status",
+  "dependents",
+  "purpose",
+  "savings_account",
+  "checking_account",
+  "existing_loans_count",
+  "job_type",
+  "foreign_worker"
+]
