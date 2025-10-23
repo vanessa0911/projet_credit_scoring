@@ -1,41 +1,18 @@
-# =============================
-# Dépendances principales API
-# =============================
+cat > requirements.txt << 'EOF'
+# --- runtime ---
+fastapi>=0.110,<0.116
+uvicorn[standard]>=0.23,<0.33
+pydantic>=2.5,<3
+requests>=2.31,<3
 
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pydantic==2.8.2
-pydantic-core==2.20.1
-joblib==1.4.2
-requests==2.32.3
+# data utils (needed by your app)
+pandas>=2.1,<3
+numpy>=1.26,<3
 
-# =============================
-# Machine Learning / Data Science
-# =============================
+# dashboard
+streamlit>=1.32,<2
 
-numpy==2.1.1
-pandas==2.2.2
-pyarrow==17.0.0
-scikit-learn==1.5.2
-matplotlib==3.9.2
-plotly==5.24.1
-
-# =============================
-# Dashboard / UI
-# =============================
-
-streamlit==1.38.0
-
-# =============================
-# Outils divers
-# =============================
-
-tqdm==4.66.5
-typing_extensions==4.12.2
-
-# =============================
-# Notes :
-# - Versions testées et compatibles entre elles (2025)
-# - Corrige les erreurs type "_ARRAY_API", "multiarray" ou "numpy.core._multiarray_umath"
-# - Adapté à Python 3.12 (Codespaces par défaut)
-# =============================
+# optional but supported by your app (won't break if unused)
+scikit-learn>=1.3,<2
+plotly>=5.18,<6
+EOF
