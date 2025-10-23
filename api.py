@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -11,58 +11,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 
 # ------------------------------------------------------------------------------
-# Configuration générale
+# App + CORS
 # ------------------------------------------------------------------------------
-
-app = FastAPI(title="Credit Scoring API", version="1.1.0")
+app = FastAPI(title="Credit Scoring API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Codespaces : on ouvre à tout
+    allow_origins=["*"],  # Codespaces: ouvert large
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ------------------------------------------------------------------------------
-# Chemins et caches
+# Constantes & cache
 # ------------------------------------------------------------------------------
-
 DATA_CSV = Path("data/application_train.csv")
 ARTIFACTS_DIR = Path("artifacts")
 REF_STATS_JSON = ARTIFACTS_DIR / "ref_stats.json"
-GLOBAL_IMPORTANCE_CSV = ARTIFACTS_DIR / "global_importance.csv"
 INTERP_SUMMARY_JSON = ARTIFACTS_DIR / "interpretability_summary.json"
 
 _expected_columns_cache: Optional[List[str]] = None
 _top_features_cache: Optional[List[str]] = None
 
 # ------------------------------------------------------------------------------
-# Fonctions utilitaires
+# Utilitaires colonnes attendues
 # ------------------------------------------------------------------------------
-
-def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def _endpoint_list() -> List[str]:
-    """Retourne la liste des endpoints exposés."""
-    return [r.path for r in app.routes if isinstance(r, APIRoute)]
-
-
-# ------------------------------------------------------------------------------
-# Colonnes attendues
-# ------------------------------------------------------------------------------
-
 def _load_expected_columns() -> List[str]:
     """
-    Liste des colonnes d’entrée du modèle.
-    Ordre de priorité :
+    Ordre de priorité:
       1) en-tête du CSV si présent et non vide
-      2) artefacts/ref_stats.json si non vide
+      2) ref_stats.json si non vide
       3) fallback minimal (3 colonnes)
     """
     global _expected_columns_cache
@@ -72,8 +51,7 @@ def _load_expected_columns() -> List[str]:
     # 1) depuis le CSV
     if DATA_CSV.exists():
         try:
-            df_head = pd.read_csv(DATA_CSV, nrows=0)
-            cols = list(df_head.columns)
+            cols = list(pd.read_csv(DATA_CSV, nrows=0).columns)
             if cols:
                 _expected_columns_cache = cols
                 return _expected_columns_cache
@@ -101,64 +79,79 @@ def _load_expected_columns() -> List[str]:
     _expected_columns_cache = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "AGE_YEARS"]
     return _expected_columns_cache
 
-
 # ------------------------------------------------------------------------------
-# Top features (les 10 plus importantes)
+# Utilitaires top-features (robustes sur n'importe quel CSV d'artefacts)
 # ------------------------------------------------------------------------------
+_DEFAULT_TOP10 = [
+    "AMT_CREDIT",
+    "AMT_INCOME_TOTAL",
+    "EXT_SOURCE_2",
+    "EXT_SOURCE_3",
+    "DAYS_BIRTH",
+    "DAYS_EMPLOYED",
+    "AMT_ANNUITY",
+    "AMT_GOODS_PRICE",
+    "REGION_RATING_CLIENT",
+    "CNT_FAM_MEMBERS",
+]
 
-def _default_top_features() -> List[str]:
-    """Fallback robuste (10 variables typiques Home Credit)."""
-    return [
-        "AMT_CREDIT",
-        "AMT_INCOME_TOTAL",
-        "EXT_SOURCE_2",
-        "EXT_SOURCE_3",
-        "DAYS_BIRTH",
-        "DAYS_EMPLOYED",
-        "AMT_ANNUITY",
-        "AMT_GOODS_PRICE",
-        "REGION_RATING_CLIENT",
-        "CNT_FAM_MEMBERS",
+def _pick_feature_and_importance_columns(df: pd.DataFrame) -> Tuple[str, Optional[str]]:
+    """
+    Devine la colonne 'feature' et optionnellement la colonne d'importance.
+    - Si aucune importance claire, on retournera (feature_col, None) et on gardera l'ordre.
+    """
+    cols_lower = [c.lower() for c in df.columns]
+    # Essayer des noms fréquents pour la colonne feature
+    feature_aliases = ["feature", "features", "variable", "name", "column"]
+    feature_col = None
+    for alias in feature_aliases:
+        if alias in cols_lower:
+            feature_col = df.columns[cols_lower.index(alias)]
+            break
+    if feature_col is None:
+        # fallback: première colonne textuelle
+        feature_col = df.columns[0]
+
+    # Chercher une colonne d'importance
+    imp_aliases = [
+        "importance", "gain", "weight", "shap", "abs_importance",
+        "feature_importance", "feature_importances", "importance_mean",
     ]
+    imp_col: Optional[str] = None
+    for alias in imp_aliases:
+        if alias in cols_lower:
+            imp_col = df.columns[cols_lower.index(alias)]
+            break
 
+    return feature_col, imp_col
 
-def _load_top_features_from_csv(path: Path) -> Optional[List[str]]:
+def _load_top_features_from_any_csv(path: Path) -> Optional[List[str]]:
     try:
         df = pd.read_csv(path)
-        cols = [c.lower() for c in df.columns]
-        if "feature" in cols:
-            fcol = df.columns[cols.index("feature")]
-        else:
-            fcol = df.columns[0]
-
-        icandidates = ["importance", "gain", "weight", "abs_importance", "shap"]
-        icol: Optional[str] = None
-        for cand in icandidates:
-            if cand in cols:
-                icol = df.columns[cols.index(cand)]
-                break
-
-        if icol:
-            df = df[[fcol, icol]].dropna()
-            df = df.sort_values(by=icol, key=lambda s: s.abs(), ascending=False)
-            feats = df[fcol].astype(str).tolist()
-        else:
-            feats = df[fcol].astype(str).tolist()
-
-        feats = [f for f in feats if f and f.strip()]
-        if feats:
-            return feats[:10]
+        if df.shape[1] == 0 or df.shape[0] == 0:
+            return None
+        fcol, icol = _pick_feature_and_importance_columns(df)
+        # Nettoyage
+        df = df[[fcol] + ([icol] if icol and icol in df.columns else [])].dropna(subset=[fcol])
+        df[fcol] = df[fcol].astype(str)
+        if icol and icol in df.columns:
+            # tri par importance absolue décroissante
+            try:
+                df = df.sort_values(by=icol, key=lambda s: pd.to_numeric(s, errors="coerce").abs(), ascending=False)
+            except Exception:
+                # si non numérique, garder l'ordre
+                pass
+        feats = [f for f in df[fcol].tolist() if f.strip()]
+        return feats[:10] if feats else None
     except Exception:
-        pass
-    return None
-
+        return None
 
 def _load_top_features_from_json(path: Path) -> Optional[List[str]]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             obj = json.load(f)
         gi = obj.get("global_importance") or obj.get("global_importances")
-        if isinstance(gi, dict):
+        if isinstance(gi, dict) and gi:
             feats = [k for k, _ in sorted(gi.items(), key=lambda kv: abs(kv[1]), reverse=True)]
             feats = [f for f in feats if isinstance(f, str) and f.strip()]
             if feats:
@@ -172,44 +165,51 @@ def _load_top_features_from_json(path: Path) -> Optional[List[str]]:
         pass
     return None
 
+def _scan_artifacts_for_top10() -> Optional[List[str]]:
+    """Parcourt tous les CSV de artifacts/ et retourne la première Top-10 plausible."""
+    if not ARTIFACTS_DIR.exists():
+        return None
+    # Priorités légères : fichiers dont le nom contient "importance" ou "shap"
+    csvs = sorted(ARTIFACTS_DIR.glob("*.csv"))
+    priority = [p for p in csvs if any(k in p.name.lower() for k in ("importance", "importances", "shap"))]
+    others = [p for p in csvs if p not in priority]
+    for path in priority + others:
+        feats = _load_top_features_from_any_csv(path)
+        if feats:
+            return feats
+    # sinon, tenter le JSON
+    if INTERP_SUMMARY_JSON.exists():
+        feats = _load_top_features_from_json(INTERP_SUMMARY_JSON)
+        if feats:
+            return feats
+    return None
 
 def _load_top_features() -> List[str]:
-    """
-    Renvoie la liste des 10 variables globalement les plus impactantes.
-    Ordre : global_importance.csv > interpretability_summary.json > défaut.
-    Ne renvoie jamais [].
-    """
+    """NE RENVOIE JAMAIS une liste vide : scan CSV/JSON, sinon fallback."""
     global _top_features_cache
     if _top_features_cache is not None:
         return _top_features_cache
 
-    # 1) CSV
-    if GLOBAL_IMPORTANCE_CSV.exists():
-        feats = _load_top_features_from_csv(GLOBAL_IMPORTANCE_CSV)
-        if feats:
-            _top_features_cache = feats
-            return _top_features_cache
+    feats = _scan_artifacts_for_top10()
+    if feats:
+        _top_features_cache = feats
+        return _top_features_cache
 
-    # 2) JSON
-    if INTERP_SUMMARY_JSON.exists():
-        feats = _load_top_features_from_json(INTERP_SUMMARY_JSON)
-        if feats:
-            _top_features_cache = feats
-            return _top_features_cache
-
-    # 3) Fallback
-    _top_features_cache = _default_top_features()
+    _top_features_cache = _DEFAULT_TOP10[:]
     return _top_features_cache
 
-
 # ------------------------------------------------------------------------------
-# Logique de prédiction (fallback simple)
+# Fallback de proba (pour dev/démo)
 # ------------------------------------------------------------------------------
+def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 def _fallback_probability(features: Dict[str, Any]) -> float:
     """
-    Fallback heuristique : estime la probabilité de défaut
-    à partir du ratio CREDIT / INCOME.
+    Heuristique simple basée sur ratio CREDIT/INCOME (borne 0.01..0.99).
     """
     credit = None
     income = None
@@ -227,75 +227,69 @@ def _fallback_probability(features: Dict[str, Any]) -> float:
         prob = 0.5
     return float(prob)
 
+def _endpoint_list() -> List[str]:
+    return [r.path for r in app.routes if isinstance(r, APIRoute)]
 
 # ------------------------------------------------------------------------------
-# Endpoints FastAPI
+# Endpoints
 # ------------------------------------------------------------------------------
-
 @app.get("/")
 def root() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "name": "Credit Scoring API",
-        "endpoints": _endpoint_list(),
-    }
-
+    return {"status": "ok", "name": "Credit Scoring API", "endpoints": _endpoint_list()}
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "name": "Credit Scoring API",
-        "endpoints": _endpoint_list(),
-    }
-
+    return {"status": "ok", "name": "Credit Scoring API", "endpoints": _endpoint_list()}
 
 @app.get("/expected_columns")
 def expected_columns() -> List[str]:
     return _load_expected_columns()
 
-
 @app.get("/top_features")
 def top_features() -> List[str]:
     return _load_top_features()
 
+@app.get("/debug/artifacts")
+def debug_artifacts() -> Dict[str, Any]:
+    """
+    Aide au diagnostic : liste les fichiers dans artifacts/ et
+    montre le premier aperçu de CSV utilisable si trouvé.
+    """
+    info: Dict[str, Any] = {
+        "artifacts_dir_exists": ARTIFACTS_DIR.exists(),
+        "csv_files": [],
+        "json_files": [],
+        "chosen_top10": _load_top_features(),
+    }
+    if ARTIFACTS_DIR.exists():
+        info["csv_files"] = [p.name for p in ARTIFACTS_DIR.glob("*.csv")]
+        info["json_files"] = [p.name for p in ARTIFACTS_DIR.glob("*.json")]
+    return info
 
 @app.post("/predict")
 def predict(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Le corps doit être un objet JSON {clé: valeur}.")
-
     prob = _fallback_probability(payload)
     threshold = 0.5
     decision = int(prob >= threshold)
-
-    return {
-        "probability": prob,
-        "decision": decision,
-        "threshold": threshold,
-        "used_columns_count": len(_load_expected_columns()),
-    }
-
+    return {"probability": prob, "decision": decision, "threshold": threshold, "used_columns_count": len(_load_expected_columns())}
 
 @app.post("/predict_proba_batch")
 def predict_proba_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
     instances = payload.get("instances")
     if not isinstance(instances, list):
         raise HTTPException(status_code=400, detail="Le corps doit contenir une liste 'instances'.")
-
-    probs: List[float] = []
+    probs = []
     for row in instances:
         if not isinstance(row, dict):
             raise HTTPException(status_code=400, detail="Chaque instance doit être un objet JSON.")
         probs.append(_fallback_probability(row))
-
     return {"probabilities": probs, "count": len(probs)}
-
 
 # ------------------------------------------------------------------------------
 # Exécution directe
 # ------------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
