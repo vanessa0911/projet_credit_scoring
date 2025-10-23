@@ -1,178 +1,159 @@
-# ================================================================
-#  api.py — API FastAPI robuste (sans secrets obligatoires)
-#  Lit les artefacts locaux si disponibles, sinon dégrade proprement.
-# ================================================================
-
-from fastapi import FastAPI
-from pydantic import BaseModel
+# api.py
+from __future__ import annotations
+import os, json, hashlib, joblib
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any, Optional
-import os, json, pathlib
 
-# ------------------------------------------------
-# Configuration: répertoires / fichiers artefacts
-# ------------------------------------------------
 ARTIFACTS_DIR = os.getenv("ARTIFACTS_DIR", "artifacts")
-EXPECTED_COLUMNS_PATH = os.getenv("EXPECTED_COLUMNS_PATH", os.path.join(ARTIFACTS_DIR, "expected_columns.json"))
-KEY_FEATURES_PATH = os.getenv("KEY_FEATURES_PATH", os.path.join(ARTIFACTS_DIR, "key_features.json"))
-GLOBAL_IMPORTANCE_PATH = os.getenv("GLOBAL_IMPORTANCE_PATH", os.path.join(ARTIFACTS_DIR, "global_importance.csv"))
+META_PATH = os.path.join(ARTIFACTS_DIR, "metadata.json")
+MODEL_PATH = os.path.join(ARTIFACTS_DIR, "model_latest.joblib")
+FEATURES_PATH = os.path.join(ARTIFACTS_DIR, "feature_names.npy")
+REF_STATS_PATH = os.path.join(ARTIFACTS_DIR, "ref_stats.json")
 
-pathlib.Path(ARTIFACTS_DIR).mkdir(parents=True, exist_ok=True)
+app = FastAPI(title="Credit Scoring API", version="1.0.0")
 
-def _read_json_list(path: str) -> List[str]:
-    try:
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return [str(x) for x in data]
-            if isinstance(data, dict):
-                # tolère {"columns":[...]} ou {"features":[...]}
-                for k in ("columns", "features"):
-                    if k in data and isinstance(data[k], list):
-                        return [str(x) for x in data[k]]
-    except Exception:
-        pass
-    return []
-
-def _read_global_importance(path: str) -> Optional[pd.DataFrame]:
-    try:
-        if os.path.isfile(path):
-            df = pd.read_csv(path)
-            if {"feature", "importance"}.issubset(df.columns):
-                # cast
-                df["feature"] = df["feature"].astype(str)
-                df["importance"] = pd.to_numeric(df["importance"], errors="coerce")
-                df = df.dropna(subset=["importance"])
-                return df
-    except Exception:
-        pass
-    return None
-
-EXPECTED_COLUMNS: List[str] = _read_json_list(EXPECTED_COLUMNS_PATH)
-if not EXPECTED_COLUMNS:
-    # fallback minimal si artefact absent
-    EXPECTED_COLUMNS = [
-        "gender", "age", "income", "loan_amount", "loan_duration",
-        "employment_years", "credit_history", "housing",
-    ]
-
-KEY_FEATURES: List[str] = _read_json_list(KEY_FEATURES_PATH)
-if not KEY_FEATURES:
-    # fallback "métier" si artefact absent
-    KEY_FEATURES = ["income", "loan_amount", "loan_duration", "credit_history", "age"]
-
-GLOBAL_IMPORTANCE = _read_global_importance(GLOBAL_IMPORTANCE_PATH)
-
-# ------------------------------------------------
-# App FastAPI
-# ------------------------------------------------
-app = FastAPI(
-    title="Credit Scoring API",
-    description="API pour la prédiction et l’explicabilité du risque crédit.",
-    version="1.1.0",
+# CORS (ajuste la whitelist si besoin)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-class Features(BaseModel):
-    features: Dict[str, Any]
+# ------- Chargement artefacts ------- #
+def _load_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-class Rows(BaseModel):
-    rows: List[Dict[str, Any]]
+def _hash_list(values: List[str]) -> str:
+    m = hashlib.sha256()
+    for v in values:
+        m.update(v.encode("utf-8"))
+    return m.hexdigest()[:12]
 
-# ------------------------------------------------
-# Modèle (placeholder) — à remplacer par ton pipeline
-# ------------------------------------------------
-def dummy_model_predict_proba(df: pd.DataFrame) -> np.ndarray:
-    """
-    Simulation : probabilité de défaut ~ loan_amount / 100k + bruit.
-    Remplace par (preprocessor -> model.predict_proba) quand tes artefacts sont prêts.
-    """
-    amt = pd.to_numeric(df.get("loan_amount", pd.Series([10000]*len(df))), errors="coerce").fillna(10000)
-    base = 0.2 + 0.3 * (amt / 100000.0)
-    noise = np.random.normal(0, 0.05, size=len(df))
-    proba = np.clip(base + noise, 0, 1)
-    return proba
+try:
+    META = _load_json(META_PATH)
+except FileNotFoundError:
+    raise RuntimeError(f"metadata.json introuvable à {META_PATH}")
 
-# ------------------------------------------------
-# Endpoints
-# ------------------------------------------------
+EXPECTED_COLUMNS: List[str] = META.get("expected_input_columns") or []
+if not EXPECTED_COLUMNS and os.path.exists(FEATURES_PATH):
+    EXPECTED_COLUMNS = np.load(FEATURES_PATH, allow_pickle=True).tolist()
+
+if not EXPECTED_COLUMNS:
+    raise RuntimeError("Aucune liste de colonnes attendues ('expected_input_columns').")
+
+SCHEMA_HASH = _hash_list(EXPECTED_COLUMNS)
+THRESHOLD: float = float(META.get("threshold", 0.5))
+MODEL_VERSION: str = str(META.get("model_version", "unknown"))
+TARGET_PREVALENCE: Optional[float] = META.get("target_prevalence")
+
+if not os.path.exists(MODEL_PATH):
+    raise RuntimeError(f"Modèle introuvable à {MODEL_PATH}")
+
+MODEL = joblib.load(MODEL_PATH)
+
+REF_STATS: Dict[str, Any] = {}
+if os.path.exists(REF_STATS_PATH):
+    REF_STATS = _load_json(REF_STATS_PATH)
+
+# ------- Schémas Pydantic ------- #
+class Record(BaseModel):
+    data: Dict[str, Any] = Field(..., description="Une observation avec toutes les colonnes attendues")
+
+class Records(BaseModel):
+    records: List[Dict[str, Any]]
+
+# ------- Normalisation d'entrée ------- #
+def align_cast_dataframe(payload: Dict[str, Any]) -> pd.DataFrame:
+    # 1) aligne les colonnes attendues, renseigne None si manquantes
+    row = {col: payload.get(col, None) for col in EXPECTED_COLUMNS}
+    X = pd.DataFrame([row], columns=EXPECTED_COLUMNS)
+
+    # 2) cast léger basé sur ref_stats.json (si dispo)
+    if REF_STATS and "columns" in REF_STATS:
+        col_meta = REF_STATS["columns"]
+        for col in EXPECTED_COLUMNS:
+            role = (col_meta.get(col, {}).get("role") or "").lower()
+            if role == "numeric":
+                # essais de cast numérique non bloquant
+                X[col] = pd.to_numeric(X[col], errors="coerce")
+            elif role == "boolean":
+                # map simples
+                X[col] = X[col].map(
+                    {True: 1, False: 0, "True": 1, "False": 0, "Y": 1, "N": 0}
+                ).astype("float64")
+            # categorical : on laisse tel quel (le pipeline encodera)
+
+    return X
+
+def align_cast_dataframe_batch(payloads: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for p in payloads:
+        rows.append({col: p.get(col, None) for col in EXPECTED_COLUMNS})
+    X = pd.DataFrame(rows, columns=EXPECTED_COLUMNS)
+
+    if REF_STATS and "columns" in REF_STATS:
+        col_meta = REF_STATS["columns"]
+        for col in EXPECTED_COLUMNS:
+            role = (col_meta.get(col, {}).get("role") or "").lower()
+            if role == "numeric":
+                X[col] = pd.to_numeric(X[col], errors="coerce")
+            elif role == "boolean":
+                X[col] = X[col].map(
+                    {True: 1, False: 0, "True": 1, "False": 0, "Y": 1, "N": 0}
+                ).astype("float64")
+    return X
+
+# ------- Endpoints ------- #
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "API Credit Scoring opérationnelle."}
+    return {
+        "status": "ok",
+        "model_version": MODEL_VERSION,
+        "threshold": THRESHOLD,
+        "n_features": len(EXPECTED_COLUMNS),
+        "schema_hash": SCHEMA_HASH,
+        "target_prevalence": TARGET_PREVALENCE,
+        "has_ref_stats": bool(REF_STATS),
+    }
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 @app.get("/expected_columns")
 def expected_columns():
-    return EXPECTED_COLUMNS
-
-@app.get("/key_features")
-def key_features():
-    return {"features": KEY_FEATURES}
+    return {"expected_columns": EXPECTED_COLUMNS, "count": len(EXPECTED_COLUMNS), "schema_hash": SCHEMA_HASH}
 
 @app.post("/predict")
-def predict(payload: Features):
+def predict(rec: Record):
     try:
-        x = pd.DataFrame([payload.features])
-        proba = float(dummy_model_predict_proba(x)[0])
-        y_hat = int(proba >= 0.5)
-        return {"proba": proba, "y_hat": y_hat}
+        X = align_cast_dataframe(rec.data)
+        proba = float(MODEL.predict_proba(X)[:, 1][0])
+        decision = int(proba >= THRESHOLD)
+        return {"probability": proba, "decision": decision, "model_version": MODEL_VERSION}
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/predict_proba_batch")
-def predict_proba_batch(payload: Rows):
+def predict_proba_batch(recs: Records):
     try:
-        X = pd.DataFrame(payload.rows)
-        pred_proba = dummy_model_predict_proba(X)
-        y_hat = (pred_proba >= 0.5).astype(int)
-        return {"pred_proba": pred_proba.tolist(), "y_hat": y_hat.tolist()}
-    except Exception as e:
-        return {"error": str(e)}
-
-try:
-    import shap  # noqa
-    SHAP_OK = True
-except Exception:
-    SHAP_OK = False
-
-@app.get("/global_importance")
-def global_importance():
-    """
-    Importance globale à partir de artifacts/global_importance.csv si dispo,
-    sinon fallback (aléatoire stable sur EXPECTED_COLUMNS).
-    """
-    try:
-        if GLOBAL_IMPORTANCE is not None and not GLOBAL_IMPORTANCE.empty:
-            return GLOBAL_IMPORTANCE.sort_values("importance", ascending=False).to_dict(orient="records")
-        # fallback
-        rng = np.random.default_rng(42)
-        imp = rng.random(len(EXPECTED_COLUMNS))
-        df = pd.DataFrame({"feature": EXPECTED_COLUMNS, "importance": imp})
-        return df.sort_values("importance", ascending=False).to_dict(orient="records")
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/shap_local")
-def shap_local(payload: Features):
-    """
-    Placeholder SHAP local. Retourne des valeurs simulées si SHAP installé,
-    sinon message explicite. À brancher sur ton vrai modèle plus tard.
-    """
-    if not SHAP_OK:
-        return {"detail": "SHAP non disponible côté serveur."}
-    try:
-        n = len(EXPECTED_COLUMNS)
-        rng = np.random.default_rng()
-        shap_values = rng.normal(0, 0.02, n).tolist()
-        base_value = 0.2
+        if not recs.records:
+            raise ValueError("Payload vide.")
+        X = align_cast_dataframe_batch(recs.records)
+        proba = MODEL.predict_proba(X)[:, 1].astype(float).tolist()
+        decisions = [int(p >= THRESHOLD) for p in proba]
         return {
-            "feature_names": EXPECTED_COLUMNS,
-            "shap_values": shap_values,
-            "base_value": base_value,
+            "probabilities": proba,
+            "decisions": decisions,
+            "count": len(proba),
+            "model_version": MODEL_VERSION,
         }
     except Exception as e:
-        return {"error": str(e)}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+        raise HTTPException(status_code=400, detail=str(e))
