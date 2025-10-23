@@ -10,6 +10,90 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 
+
+# api.py (extraits à ajouter)
+from fastapi import FastAPI
+from pydantic import BaseModel
+import numpy as np
+import pandas as pd
+
+
+# Charger votre modèle et votre pipeline comme déjà fait dans votre repo
+# model = ...
+# preprocessor = ...
+
+
+try:
+import shap
+SHAP_OK = True
+explainer = None # lazy init
+except Exception:
+SHAP_OK = False
+
+
+app = FastAPI()
+
+
+class Features(BaseModel):
+features: dict
+
+
+class Rows(BaseModel):
+rows: list
+
+
+@app.get("/global_importance")
+def global_importance():
+"""Retourne l'importance globale (SHAP moyen absolu si SHAP disponible, sinon importance du modèle si dispo)."""
+global explainer
+try:
+# Option 1 : SHAP global (préféré)
+if SHAP_OK:
+if explainer is None:
+# Construire un petit background pour SHAP (ex: 1k échantillons d'un dataset de ref)
+# X_bg = pd.read_parquet("artifacts/ref_sample.parquet") # adapter
+# X_bg_proc = preprocessor.transform(X_bg)
+# explainer = shap.Explainer(model, X_bg_proc)
+pass # implémenter selon vos artefacts
+# importance = np.abs(explainer.expected_value) # ceci n'est pas la bonne métrique
+# => Préférez calculer mean(|SHAP|) sur un set de ref
+# shap_vals = explainer(X_bg_proc)
+# gi = np.mean(np.abs(shap_vals.values), axis=0)
+# return [{"feature": f, "importance": float(w)} for f, w in zip(feature_names, gi)]
+raise NotImplementedError
+else:
+# Option 2 : importance du modèle (ex. feature_importances_)
+if hasattr(model, "feature_importances_"):
+imps = model.feature_importances_.ravel()
+feature_names = preprocessor.get_feature_names_out()
+return [{"feature": f, "importance": float(w)} for f, w in zip(feature_names, imps)]
+except Exception:
+pass
+return []
+
+
+@app.post("/shap_local")
+def shap_local(payload: Features):
+"""Explique un dossier (retourne les SHAP values + base_value)."""
+if not SHAP_OK:
+return {"detail": "SHAP non disponible côté serveur"}
+# x = pd.DataFrame([payload.features])
+# x_proc = preprocessor.transform(x)
+# global explainer
+# if explainer is None:
+# # idem : initialiser sur un background
+# X_bg_proc = ...
+# explainer = shap.Explainer(model, X_bg_proc)
+# sv = explainer(x_proc)
+# return {
+# "feature_names": list(preprocessor.get_feature_names_out()),
+# "shap_values": sv.values[0].tolist(),
+# "base_value": float(sv.base_values[0]) if hasattr(sv, "base_values") else None,
+# }
+return {"detail": "À implémenter selon vos artefacts"}
+
+
+
 # ------------------------------------------------------------------------------
 # App + CORS
 # ------------------------------------------------------------------------------
