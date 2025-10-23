@@ -1,8 +1,16 @@
-# 🧩 Projet Credit Scoring — Version 0 (Stable)
+# 🧩 Projet Credit Scoring — Version Stable
 
-## ✅ État fonctionnel validé
-Cette version correspond à la configuration **stable et fonctionnelle** du projet.  
-Elle sert de **point de restauration officiel** (« version 0 ») en cas de régression.
+0) Lancer le Codespace
+
+1) Installer deps
+bash setup_env.sh
+
+2) Lancer l’API (Terminal A)
+bash run_api.sh
+
+3) Lancer le dashboard (Terminal B)
+bash run_ui.sh
+
 
 ---
 
@@ -31,20 +39,7 @@ Elle sert de **point de restauration officiel** (« version 0 ») en cas de rég
 | `data/` | Contient les datasets de base (`application_train.csv`, etc.). |
 | `requirements.txt` | Liste des dépendances Python. |
 
----
 
-## ⚙️ Commandes de lancement
-
-### Terminal A → Lancer l’API
-```bash
-python -m uvicorn api:app --host 0.0.0.0 --port 8000 --reload
-
-Terminal B → Lancer le Dashboard
-python -m streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501
-
-Ouvrir le Dashboard
-
-Dans GitHub Codespaces, onglet Ports → ouvrir le port 8501 (globe 🌍)
 
 Dans la sidebar Streamlit, définir l’URL de l’API sur l’adresse publique du port 8000 :
 
