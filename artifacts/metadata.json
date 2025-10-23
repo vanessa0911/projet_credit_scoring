@@ -1,31 +1,21 @@
 {
-  "chosen_model": "isotonic",
-  "champion_algo": "lgbm",
-  "decision_threshold": {
-    "c_fp": 1.0,
-    "c_fn": 5.0,
-    "t_selected": 0.67,
-    "counts_valid": {
-      "tn": 50802,
-      "fp": 5736,
-      "fn": 2939,
-      "tp": 2026
-    }
-  },
-  "metrics_valid": {
-    "auc": 0.78,
-    "pr_auc": 0.22,
-    "brier": 0.14
-  },
+  "model_version": "2025-09-12",
+  "trained_on": "2025-09-12T10:00:00Z",
+  "threshold": 0.35,
+  "target_prevalence": 0.08,
   "expected_input_columns": [
-    "AMT_INCOME_TOTAL",
-    "AMT_CREDIT",
+    "EXT_SOURCE_2",
+    "EXT_SOURCE_3",
     "DAYS_BIRTH",
+    "AMT_INCOME_TOTAL",
     "DAYS_EMPLOYED",
-    "CNT_CHILDREN",
-    "AMT_ANNUITY",
+    "CREDIT_TERM",
+    "ANNUITY_TO_INCOME",
+    "CREDIT_TO_INCOME",
+    "CNT_FAM_MEMBERS",
+    "NAME_FAMILY_STATUS",
     "NAME_CONTRACT_TYPE"
-    // ... (liste complète des colonnes attendues par le pipeline)
+    // ... complète selon ton feature set exact (même ordre que le modèle)
   ],
-  "random_state": 42
+  "notes": "Hash du schéma validé côté API pour refuser les inputs incohérents."
 }
