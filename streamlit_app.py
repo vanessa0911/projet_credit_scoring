@@ -457,3 +457,4 @@ with TAB_DS:
         - **Interprétabilité globale** : hiérarchie moyenne des facteurs conduisant le modèle.
         """
     )
+ 
