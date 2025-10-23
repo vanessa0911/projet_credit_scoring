@@ -1,10 +1,21 @@
 {
   "model_version": "2025-09-12",
   "trained_on": "2025-09-12T10:00:00Z",
+  "publisher": "vanessa0911",
+  "environment": "local",
   "threshold": 0.35,
-  "target_prevalence": 0.08,
+  "decision_policy": {
+    "type": "fixed_threshold",
+    "value": 0.35,
+    "rationale": "Compromis business précision/recall; ajustable dans l’UI"
+  },
   "target_name": "TARGET",
   "id_column": "SK_ID_CURR",
+  "target_prevalence": 0.08,
+  "data_signature": {
+    "n_features": 11,
+    "feature_order_locked": true
+  },
   "expected_input_columns": [
     "EXT_SOURCE_2",
     "EXT_SOURCE_3",
@@ -18,12 +29,47 @@
     "NAME_FAMILY_STATUS",
     "NAME_CONTRACT_TYPE"
   ],
+  "feature_types": {
+    "EXT_SOURCE_2": "numeric",
+    "EXT_SOURCE_3": "numeric",
+    "DAYS_BIRTH": "numeric",
+    "AMT_INCOME_TOTAL": "numeric",
+    "DAYS_EMPLOYED": "numeric",
+    "CREDIT_TERM": "numeric",
+    "ANNUITY_TO_INCOME": "numeric",
+    "CREDIT_TO_INCOME": "numeric",
+    "CNT_FAM_MEMBERS": "numeric",
+    "NAME_FAMILY_STATUS": "categorical",
+    "NAME_CONTRACT_TYPE": "categorical"
+  },
   "artifacts": {
     "model_path": "artifacts/model_latest.joblib",
     "feature_names_path": "artifacts/feature_names.npy",
     "ref_stats_path": "artifacts/ref_stats.json",
     "global_importance_path": "artifacts/global_importance.csv",
-    "interpretability_summary_path": "artifacts/interpretability_summary.json"
+    "interpretability_summary_path": "artifacts/interpretability_summary.json",
+    "training_code_ref": "notebooks/train_pipeline.ipynb"
   },
-  "notes": "Schéma attendu par le modèle. Met à jour la liste si le pipeline change."
+  "training_info": {
+    "library": "scikit-learn",
+    "estimator": "GradientBoosting or XGBoost (ajuster la valeur réelle)",
+    "random_seed": 42,
+    "metrics": {
+      "validation_auc": 0.78,
+      "validation_logloss": null
+    }
+  },
+  "input_validation": {
+    "strict_order": true,
+    "unknown_columns": "ignore",
+    "missing_policy": "impute_or_pass_to_pipeline"
+  },
+  "security": {
+    "allow_origins": ["*"]
+  },
+  "monitoring": {
+    "log_payload_shapes": true,
+    "log_latency_ms": true
+  },
+  "notes": "Fichier maître pour l’API et l’UI Streamlit. Mettre à jour `feature_types` et `metrics` après tout ré-entraînement."
 }
